@@ -1,6 +1,6 @@
 {
   "name": "grok-codex-worker",
-  "version": "0.1.0+codex.20260822175452",
+  "version": "0.1.0+codex.20260823055456",
   "description": "A reliable Grok worker for Codex with Windows discovery and artifact verification.",
   "author": {
     "name": "stdevMac",

@@ -2,6 +2,8 @@
 
 Use [Grok](https://grok.com) from inside Codex for code reviews, delegated coding, planning, multi-agent workflows, design→execute pipelines, PR babysitting, and image/video/document generation.
 
+Detailed Chinese guide: [docs/USAGE.zh-CN.md](docs/USAGE.zh-CN.md)
+
 **Plugin version:** 0.1.0. Codex stays the orchestrator. A thin MCP server + companion script hands real work to Grok on your machine via the local CLI (Grok Build ≥ **0.2.118** recommended).
 
 Artifact dirs (gitignored): `.grok-plans/`, `.grok-designs/`, `.grok-workflows/`, `.grok-docs/`, `.grok-reviews/`, `.grok-media/`.
@@ -46,6 +48,29 @@ On Windows, Grok 1.0.5 does not document a kernel-enforced sandbox implementatio
 
 Skills: brand/media recipes, routing (including plan→design→execute-plan), runtime contracts, workflows, prompting.
 
+### One-command automatic routing
+
+Select **Grok Codex Worker: Grok Auto** from the `/` skills menu, or explicitly
+invoke `$grok-auto`. The mode is limited to the current Codex task and never
+writes project guidance:
+
+```text
+$grok-auto on       # AUTO for this task
+$grok-auto once     # automatic routing for one request, then OFF
+$grok-auto status   # show the current task-local mode
+$grok-auto off      # stop new Grok delegation in this task
+```
+
+In the Codex App UI, typing `/` opens the skills menu; select the Grok Auto
+entry and enter the mode or task after the inserted skill chip.
+
+In `AUTO`, Codex decides whether the request is small enough to handle directly
+or should use rescue, plan, design, review, or another Grok MCP tool. Codex still
+owns verification and all host-only plugins, MCP, browser, credential, GitHub,
+and external actions. Turning the mode off does not cancel a background job that
+was already started; cancellation remains explicit. Every new Codex task starts
+`OFF` until the skill is invoked there.
+
 ## Requirements
 
 - **Node.js 18.18 or later**
@@ -60,7 +85,7 @@ Typical CLI location: `~/.grok/bin/grok` (ensure it is on `PATH`).
 Local fork (the current development checkout):
 
 ```powershell
-codex plugin marketplace add E:\APP\CodexProject\grok-codex-worker\.agents\plugins
+codex plugin marketplace add E:\APP\CodexProject\grok-codex-worker
 codex plugin add grok-codex-worker@grok-codex-worker
 ```
 
@@ -69,7 +94,7 @@ Then start a new Codex thread so the plugin skills and MCP tools are loaded.
 ### Install locally
 
 ```bash
-codex plugin marketplace add E:\APP\CodexProject\grok-codex-worker\.agents\plugins
+codex plugin marketplace add E:\APP\CodexProject\grok-codex-worker
 codex plugin add grok-codex-worker@grok-codex-worker
 ```
 

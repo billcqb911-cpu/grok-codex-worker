@@ -80,6 +80,8 @@
 - Initial Codex MCP plugin: setup, rescue, review, adversarial review, image, video, status, result, cancel, transfer.
 ## Unreleased
 
+- Added the explicit-only `grok-auto` skill as a task-local unified entry point, with `on`, `once`, `status`, and `off` modes and no `AGENTS.md` persistence.
+- Added a detailed Chinese user guide covering Grok Auto, direct MCP calls, safety contracts, background jobs, permission boundaries, installation, updates, and troubleshooting.
 - Added Phase 7A permission and capability isolation.
 - Grok tasks now force the `strict` sandbox with `dontAsk`/`plan`, reject yolo, custom agents, memory, caller allow rules, unsafe permission/sandbox requests, and host-tool handoffs.
 - Documented Grok rules deny all Bash, Grok MCP, web-fetch, and web-search tools; Claude/Cursor compatibility discovery, subagents, workflows, telemetry, and memory are disabled in the child environment.
