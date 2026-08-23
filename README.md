@@ -1,8 +1,8 @@
-# Grok plugin for Codex
+# Grok Codex Worker
 
 Use [Grok](https://grok.com) from inside Codex for code reviews, delegated coding, planning, multi-agent workflows, design→execute pipelines, PR babysitting, and image/video/document generation.
 
-**Plugin version:** 0.5.8. Codex stays the orchestrator. A thin MCP server + companion script hands real work to Grok on your machine via the local CLI (Grok Build ≥ **0.2.118** recommended).
+**Plugin version:** 0.1.0. Codex stays the orchestrator. A thin MCP server + companion script hands real work to Grok on your machine via the local CLI (Grok Build ≥ **0.2.118** recommended).
 
 Artifact dirs (gitignored): `.grok-plans/`, `.grok-designs/`, `.grok-workflows/`, `.grok-docs/`, `.grok-reviews/`, `.grok-media/`.
 
@@ -30,7 +30,19 @@ Using Claude Code instead? Use the sibling plugin: [grok-in-claude](https://gith
 | `grok_result` | Final output (plan.md preferred for plan jobs; usage + artifacts) |
 | `grok_cancel` | Cancel a background job |
 
-**Control flags** (rescue/plan/review and long-running jobs): `sandbox`, `planMode` / `permissionMode`, `agent`, `noSubagents`, `memory` / `noMemory`, `allow` / `deny`, `disableWebSearch`, `forkSession`, `maxTurns`.
+**Control flags** (rescue/plan/review and long-running jobs): `sandbox`, `planMode` / `permissionMode`, `deny`, `disableWebSearch`, `forkSession`, `maxTurns`. Phase 7 applies a non-overridable floor: effective sandbox is always `strict`, normal headless work uses `dontAsk`, and plan jobs use `plan`. Caller `allow` rules, custom agents, memory, `acceptEdits`, `auto`, `bypassPermissions`, `off`, and `devbox` are rejected.
+
+**Capability boundary:** Codex remains the only principal that can call other Codex plugins/MCP tools, browsers, connectors, credentials, logins, uploads, or external submissions. Grok receives only a bounded project-worker handoff. Set `hostToolRequired=true` on an MCP request when the task requires a host capability; the worker rejects that delegation before Grok starts. Child execution uses an explicit environment allowlist, disables web search/fetch, subagents, memory, workflows, telemetry, and Claude/Cursor compatibility discovery, forces the `strict` sandbox, and denies `Bash(*)`, `MCPTool(*)`, `WebFetch`, and `WebSearch`. Temporary command guards add defense in depth for host, credential, remote-shell, and network CLIs.
+
+For a task that needs a Codex capability, use this handoff instead of asking Grok to invoke it:
+
+```text
+Codex calls the host plugin/MCP -> sanitize the minimum result -> grok_rescue for project work -> Codex verifies -> Codex performs the external action.
+```
+
+The `grok_rescue` MCP approval authorizes only that one bounded worker invocation. It is not blanket approval for actions Grok might attempt inside its child process. Worker results include a redacted `workerPolicy` record with the effective sandbox, permission mode, network posture, host-tool boundary, and environment policy; it never includes prompt/file contents or credentials.
+
+On Windows, Grok 1.0.5 does not document a kernel-enforced sandbox implementation. The worker therefore reports `tool-policy-plus-snapshot` filesystem enforcement and `tool-policy-only` child-network enforcement on Windows; it does not claim Linux/macOS kernel guarantees. Write tasks remain protected by exact workspace Edit/Write rules, SHA-256 snapshots, scope validation, independent checks, and rollback, but this is not a VM boundary.
 
 Skills: brand/media recipes, routing (including plan→design→execute-plan), runtime contracts, workflows, prompting.
 
@@ -45,11 +57,11 @@ Typical CLI location: `~/.grok/bin/grok` (ensure it is on `PATH`).
 
 ## Install
 
-From GitHub:
+Local fork (the current development checkout):
 
-```bash
-codex plugin marketplace add stdevMac/grok-in-codex
-codex plugin add grok@grok-in-codex
+```powershell
+codex plugin marketplace add E:\APP\CodexProject\grok-codex-worker\.agents\plugins
+codex plugin add grok-codex-worker@grok-codex-worker
 ```
 
 Then start a new Codex thread so the plugin skills and MCP tools are loaded.
@@ -57,14 +69,14 @@ Then start a new Codex thread so the plugin skills and MCP tools are loaded.
 ### Install locally
 
 ```bash
-codex plugin marketplace add /path/to/grok-in-codex/.agents/plugins
-codex plugin add grok@grok-in-codex
+codex plugin marketplace add E:\APP\CodexProject\grok-codex-worker\.agents\plugins
+codex plugin add grok-codex-worker@grok-codex-worker
 ```
 
 Run setup:
 
 ```bash
-node plugins/grok/scripts/grok-companion.mjs setup
+node plugins/grok-codex-worker/scripts/grok-companion.mjs setup
 ```
 
 Or ask Codex to call `grok_setup`.
@@ -129,11 +141,52 @@ For multi-PR or ambiguous product work, prefer:
 - **Atomic writes** — background workers write `result.json` via tmp + rename (no partial mid-write; no leftover `.tmp.*` after success).
 - **PR post-pending** — runs on background completion too; skips empty findings; empty/oversize diffs fail closed with recoverable findings under `.grok-reviews/`.
 
+## Completion contract
+
+This fork treats Grok's narrative as untrusted until the requested result is verified.
+
+- `grok_plan` fails with `failed_artifact` when no non-empty plan exists under `.grok-plans/`.
+- `grok_document` fails with `failed_artifact` when no non-empty document exists in the requested output directory.
+- `grok_rescue`, `grok_plan`, and `grok_document` accept `expectedFiles` and `checkCommand`.
+- `expectedFiles` must stay inside `cwd`, be non-empty, and `checkCommand` must exit with code 0.
+- `allowedChangedFiles` is a strict allowlist for snapshot-detected added/modified/deleted files.
+- `forbiddenChangedPaths` rejects changes anywhere below the listed files or directories.
+- A scope violation is reported as `failed_scope`; with `rollbackOnFailure=true`, all snapshot-detected changes are restored and the terminal status is `failed_scope_rolled_back`.
+- Job results include a `contract` object containing checked paths, command output, and verification status.
+
+Example:
+
+```text
+grok_rescue cwd="C:\\work\\app" prompt="write the test report" expectedFiles=["reports\\unit.md"] allowedChangedFiles=["reports\\unit.md"] forbiddenChangedPaths=["src"] snapshot=true rollbackOnFailure=true checkCommand="npm.cmd test"
+```
+
+A successful Grok process with a missing file is therefore reported as a failed task, so Codex can retry or ask for clarification.
+
+### Workspace safety and evidence
+
+Write-capable jobs create a snapshot before Grok starts. The snapshot is stored in the plugin state directory, outside the project. On completion the job records an `added` / `modified` / `deleted` change set and exposes the snapshot manifest in `grok_result` and `grok_status`.
+
+  - `snapshot=true` forces a snapshot; write jobs use it by default and cannot disable it.
+  - `noSnapshot=true` is only valid for read-only jobs with no scope or rollback contract.
+  - Snapshot inventory records SHA-256 hashes for large files and symlink metadata; changes to
+    files excluded from copy/restore are reported as `unverified` and fail closed.
+  - `rollbackOnFailure=true` restores the pre-job files when artifact or check validation fails.
+- Scope controls require a snapshot; combining `noSnapshot=true` with `allowedChangedFiles`, `forbiddenChangedPaths`, or `rollbackOnFailure` is rejected before Grok starts.
+- Windows completion checks preserve nested quotes by running through a temporary `.cmd` file.
+  - Rollback is verified by recalculating the change set; residual changes produce `failed_rollback`.
+  - `checkPolicy` accepts `on-success` (default) or `always`.
+  - Persistent state updates use a cross-process lock and atomic replacement; background prompt
+    files are removed after the Grok process exits.
+- `checkTimeoutMs` limits a completion command to 100-3,600,000 ms (default 120,000).
+- Rollback is opt-in because a failed task may still contain useful partial work.
+
 ## CLI posture
 
-- Prefer **denylist** (`--disallowed-tools`) over tools allowlist.
-- Media: no yolo / no tools allowlist.
-- `dryRun` / `validateOnly` / babysit `list`: **read-only** (no yolo).
+- The low-level argument builder always reapplies the worker policy and rejects `--yolo` / always-approve.
+- Every delegated job uses `--sandbox strict`; normal jobs use `--permission-mode dontAsk`, plans use `plan`.
+- Shell, Grok MCP, web fetch, and web search are denied with documented Grok permission rules.
+- Grok does not run shell tests. `checkCommand` is executed separately by the companion with a secret-free environment, then included in completion verification.
+- `dryRun` / `validateOnly` / babysit `list` also deny Edit/Write.
 
 ## Environment variables
 
@@ -152,7 +205,8 @@ Default state root when unset: `~/.grok/codex-plugin/state/`. Codex does **not**
 - Write-capable by default.
 - Use `readOnly=true` for investigation-only work.
 - Use `worktree=true` / `check=true` / `bestOfN` for safer or parallel attempts.
-- Full control surface available (sandbox, memory, agent, allow/deny, maxTurns, …).
+- Use `expectedFiles`, `allowedChangedFiles`, `forbiddenChangedPaths`, and `checkCommand` for a verifiable write contract.
+- The caller may add deny rules but cannot add allow rules or enable custom agents, memory, subagents, shell, MCP, or web capabilities.
 
 ### Plan / design / execute
 
@@ -179,13 +233,13 @@ Default state root when unset: `~/.grok/codex-plugin/state/`. Codex does **not**
 
 ```bash
 npm test
-node plugins/grok/scripts/grok-companion.mjs setup --json
-node plugins/grok/mcp/server.mjs   # stdio NDJSON MCP server
+node plugins/grok-codex-worker/scripts/grok-companion.mjs setup --json
+node plugins/grok-codex-worker/mcp/server.mjs   # stdio NDJSON MCP server
 ```
 
 ## Versioning
 
-Root `package.json`, `plugins/grok/.codex-plugin/plugin.json`, and `.agents/plugins/marketplace.json` (metadata + plugin entry) share the same version string. Bump them together.
+Root `package.json`, `plugins/grok-codex-worker/.codex-plugin/plugin.json`, and `.agents/plugins/marketplace.json` (metadata + plugin entry) share the same version string. Bump them together.
 
 ## License
 

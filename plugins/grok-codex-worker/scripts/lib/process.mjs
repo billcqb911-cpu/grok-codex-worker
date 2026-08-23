@@ -3,22 +3,37 @@ import fs from "node:fs";
 import process from "node:process";
 
 export function binaryAvailable(name) {
-  const result = spawnSync("which", [name], { encoding: "utf8" });
-  return result.status === 0 && Boolean(result.stdout.trim());
+  const lookup = process.platform === "win32" ? "where.exe" : "which";
+  const result = spawnSync(lookup, [name], { encoding: "utf8", windowsHide: true });
+  if (result.status !== 0 || !String(result.stdout || "").trim()) {
+    return false;
+  }
+  return String(result.stdout).split(/\r?\n/).some((line) => line.trim());
+}
+
+function quoteWindowsArg(value) {
+  const text = String(value ?? "");
+  if (!text || /[\s"&()^|<>]/.test(text)) return `"${text.replace(/(\\*)"/g, "$1$1\\\"").replace(/(\\+)$/g, "$1$1")}"`;
+  return text;
 }
 
 export function runCommand(command, args, options = {}) {
-  return spawnSync(command, args, {
+  const isCmdScript = process.platform === "win32" && /\.(?:cmd|bat)$/i.test(String(command));
+  const actualCommand = isCmdScript ? (process.env.ComSpec || "cmd.exe") : command;
+  const actualArgs = isCmdScript
+    ? ["/d", "/s", "/c", [command, ...(args || [])].map(quoteWindowsArg).join(" ")]
+    : args;
+  return spawnSync(actualCommand, actualArgs, {
     encoding: "utf8",
     maxBuffer: options.maxBuffer ?? 20 * 1024 * 1024,
     cwd: options.cwd,
     env: options.env ?? process.env,
     input: options.input,
-    stdio: options.stdio
+    stdio: options.stdio,
+    windowsHide: true,
+    timeout: options.timeout
   });
-}
-
-export function runCommandChecked(command, args, options = {}) {
+}export function runCommandChecked(command, args, options = {}) {
   const result = runCommand(command, args, options);
   if (result.error) {
     throw result.error;

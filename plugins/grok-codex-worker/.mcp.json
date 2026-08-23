@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "grok": {
+    "grok-codex-worker": {
       "command": "node",
       "args": [
         "./mcp/server.mjs"

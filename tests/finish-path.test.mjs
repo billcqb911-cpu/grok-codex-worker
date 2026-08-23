@@ -5,8 +5,8 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { buildGrokArgs, parseGrokJsonOutput, runGrok } from "../plugins/grok/scripts/lib/grok.mjs";
-import { extractUsageFromParsed } from "../plugins/grok/scripts/lib/usage.mjs";
+import { buildGrokArgs, parseGrokJsonOutput, runGrok } from "../plugins/grok-codex-worker/scripts/lib/grok.mjs";
+import { extractUsageFromParsed } from "../plugins/grok-codex-worker/scripts/lib/usage.mjs";
 
 const MOCK = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -16,12 +16,14 @@ const MOCK = path.resolve(
 test("mock GROK_BINARY finish path returns usage and text", () => {
   const prev = process.env.GROK_BINARY;
   // grok.mjs resolveGrokBinary checks GROK_BINARY file existence — use node wrapper
-  const wrapper = path.join(os.tmpdir(), `mock-grok-bin-${Date.now()}`);
-  fs.writeFileSync(
-    wrapper,
-    `#!/usr/bin/env bash\nexec node ${JSON.stringify(MOCK)} "$@"\n`,
-    { mode: 0o755 }
+  const wrapper = path.join(
+    os.tmpdir(),
+    `mock-grok-bin-${Date.now()}${process.platform === "win32" ? ".cmd" : ""}`
   );
+  const wrapperBody = process.platform === "win32"
+    ? `@echo off\r\nnode ${JSON.stringify(MOCK)} %*\r\n`
+    : `#!/usr/bin/env bash\nexec node ${JSON.stringify(MOCK)} "$@"\n`;
+  fs.writeFileSync(wrapper, wrapperBody, { mode: 0o755 });
   process.env.GROK_BINARY = wrapper;
   try {
     const result = runGrok({
@@ -55,13 +57,16 @@ test("buildGrokArgs stop-gate safer posture flags", () => {
   const args = buildGrokArgs({
     prompt: "review",
     write: false,
-    sandbox: "read-only",
+    sandbox: "strict",
     noSubagents: true,
     yolo: false
   });
   assert.ok(args.includes("--sandbox"));
-  assert.ok(args.includes("read-only"));
+  assert.ok(args.includes("strict"));
+  assert.ok(args.includes("dontAsk"));
   assert.ok(args.includes("--no-subagents"));
   assert.ok(!args.includes("--yolo"));
-  assert.ok(args.includes("--disallowed-tools"));
+  assert.ok(!args.includes("--disallowed-tools"));
+  assert.ok(args.includes("Bash(*)"));
+  assert.ok(args.includes("Edit(*)"));
 });

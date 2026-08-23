@@ -4,6 +4,15 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 
 import { binaryAvailable, runCommand } from "./process.mjs";
+import {
+  buildWorkerEnv,
+  cleanupCommandGuard,
+  createCommandGuard,
+  HOST_ONLY_COMMANDS,
+  normalizeWorkerPolicy,
+  prependCommandGuard,
+  summarizeWorkerPolicy
+} from "./security.mjs";
 
 // Grok CLI 0.2.93: --tools ALLOWLISTS often fail session create with a
 // server-side run_terminal_cmd background-param constraint error. Prefer
@@ -18,26 +27,25 @@ export const MEDIA_DISALLOWED_TOOLS =
 // Deprecated: kept only for tests / callers that still pass tools= explicitly.
 export const READ_ONLY_TOOLS = "read_file,grep,list_dir";
 export const MEDIA_TOOLS = "image_gen,image_edit,image_to_video,reference_to_video,list_dir,read_file";
+export const WORKER_DISALLOWED_COMMANDS = HOST_ONLY_COMMANDS.map((command) => `Bash(${command} *)`).join(",");
 
 export function resolveGrokBinary() {
   const envPath = process.env.GROK_BINARY;
-  if (envPath && fs.existsSync(envPath)) {
-    return envPath;
+  if (envPath && fs.existsSync(envPath)) return envPath;
+
+  const lookup = process.platform === "win32" ? "where.exe" : "which";
+  const located = runCommand(lookup, [process.platform === "win32" ? "grok.exe" : "grok"], { windowsHide: true });
+  if (located.status === 0 && String(located.stdout || "").trim()) {
+    const first = String(located.stdout).split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+    if (first) return first;
   }
 
-  const which = runCommand("which", ["grok"]);
-  if (which.status === 0 && which.stdout.trim()) {
-    return which.stdout.trim();
-  }
-
-  const homeCandidate = path.join(os.homedir(), ".grok", "bin", "grok");
-  if (fs.existsSync(homeCandidate)) {
-    return homeCandidate;
-  }
-
-  return null;
+  const home = path.join(os.homedir(), ".grok", "bin");
+  const candidates = process.platform === "win32"
+    ? [path.join(home, "grok.exe"), path.join(home, "grok.cmd"), path.join(home, "grok")]
+    : [path.join(home, "grok")];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || null;
 }
-
 export function getGrokAvailability() {
   const binary = resolveGrokBinary();
   if (!binary) {
@@ -50,7 +58,7 @@ export function getGrokAvailability() {
     };
   }
 
-  const versionResult = runCommand(binary, ["version"]);
+  const versionResult = runCommand(binary, ["version"], { env: buildWorkerEnv(process.env, { grokBinary: binary }) });
   const versionRaw =
     versionResult.status === 0 ? versionResult.stdout.trim().split("\n")[0] : null;
   return {
@@ -70,7 +78,7 @@ export function runGrokDoctor() {
   if (!binary) {
     return { ok: false, detail: "Grok CLI not found" };
   }
-  const result = runCommand(binary, ["doctor"], { maxBuffer: 2 * 1024 * 1024 });
+  const result = runCommand(binary, ["doctor"], { maxBuffer: 2 * 1024 * 1024, env: buildWorkerEnv(process.env, { grokBinary: binary }) });
   const stdout = String(result.stdout ?? "").trim();
   const stderr = String(result.stderr ?? "").trim();
   return {
@@ -88,7 +96,7 @@ export function getGrokAuthStatus() {
     return { authenticated: false, detail: "Grok CLI not found" };
   }
 
-  const result = runCommand(binary, ["models"], { maxBuffer: 2 * 1024 * 1024 });
+  const result = runCommand(binary, ["models"], { maxBuffer: 2 * 1024 * 1024, env: buildWorkerEnv(process.env, { grokBinary: binary }) });
   const stdout = String(result.stdout ?? "");
   const stderr = String(result.stderr ?? "");
   const combined = `${stdout}\n${stderr}`;
@@ -119,6 +127,10 @@ export function getGrokAuthStatus() {
 }
 
 export function buildGrokArgs(options = {}) {
+  options = normalizeWorkerPolicy(options, {
+    toolName: options.workerPolicy?.toolName || "grok-low-level",
+    writeCapable: options.write === true
+  });
   const args = [];
 
   if (options.promptFile) {
@@ -206,33 +218,19 @@ export function buildGrokArgs(options = {}) {
     args.push("--no-plan");
   }
 
-  // Tool gating strategy (Grok 0.2.93-safe):
-  // - Prefer --disallowed-tools (denylist) over --tools (allowlist).
-  // - Only pass --tools when forceToolsAllowlist is true (debug / future CLI).
+  // Do not remove built-in tools from the session graph. Grok 1.0.5 declares
+  // get_task_output/kill_task dependencies on the terminal tool and refuses to
+  // create a session when that tool is removed. Phase 7 keeps registration
+  // intact and blocks invocation with documented permission deny rules.
   if (options.forceToolsAllowlist && options.tools) {
-    args.push("--tools", options.tools);
+    throw new Error("Caller-supplied Grok tool allowlists are not permitted by the worker policy.");
   }
 
   const isPlanMode = options.permissionMode === "plan";
 
-  if (options.disallowedTools) {
-    args.push("--disallowed-tools", options.disallowedTools);
-  } else if (options.media) {
-    args.push("--disallowed-tools", options.mediaDisallowedTools ?? MEDIA_DISALLOWED_TOOLS);
-  } else if (options.write && !isPlanMode) {
-    // Full coding agent: default toolset + auto-approve.
-    if (options.yolo !== false) {
-      args.push("--yolo");
-    }
-  } else if (!options.write || isPlanMode) {
-    // Read-only review / diagnosis / plan mode: strip shell + source editors.
-    // Plan mode still allows plan.md via Grok's plan-mode policy.
-    if (!isPlanMode) {
-      args.push(
-        "--disallowed-tools",
-        options.readOnlyDisallowedTools ?? READ_ONLY_DISALLOWED_TOOLS
-      );
-    }
+  if (options.write && !isPlanMode) {
+    // Write access is granted only by the narrow Edit/Write rules assembled by
+    // normalizeWorkerPolicy. Never add --yolo at this low-level boundary.
   }
 
   if (options.rules) {
@@ -277,8 +275,8 @@ export function humanizeGrokFailure(sources = {}) {
   ) {
     return (
       "Grok CLI rejected the tool configuration while creating a session. " +
-      "This usually means a `--tools` allowlist is incompatible with your Grok CLI version. " +
-      "This plugin uses `--disallowed-tools` denylists for media and read-only review instead. " +
+      "This usually means a tool allowlist/removal is incompatible with your Grok CLI version. " +
+      "This plugin keeps the built-in tool graph intact and enforces Phase 7 with permission deny rules. " +
       "Update the plugin or Grok CLI (`grok version`), then retry."
     );
   }
@@ -413,16 +411,26 @@ export function runGrok(options = {}) {
     throw new Error(availability.reason);
   }
 
-  const args = buildGrokArgs(options);
-  const result = runCommand(availability.binary, args, {
-    cwd: options.cwd,
-    maxBuffer: options.maxBuffer ?? 40 * 1024 * 1024,
-    env: {
-      ...process.env,
-      ...(options.env ?? {}),
-      RUST_LOG: options.rustLog ?? process.env.RUST_LOG ?? "off"
-    }
+  const effectiveOptions = normalizeWorkerPolicy(options, {
+    toolName: options.workerPolicy?.toolName || "grok-foreground",
+    writeCapable: options.write === true
   });
+  const args = buildGrokArgs(effectiveOptions);
+  const commandGuard = createCommandGuard();
+  const env = prependCommandGuard(
+    buildWorkerEnv({ ...process.env, ...(effectiveOptions.env ?? {}) }, { grokBinary: availability.binary }),
+    commandGuard
+  );
+  let result;
+  try {
+    result = runCommand(availability.binary, args, {
+      cwd: effectiveOptions.cwd,
+      maxBuffer: effectiveOptions.maxBuffer ?? 40 * 1024 * 1024,
+      env: { ...env, RUST_LOG: effectiveOptions.rustLog ?? "off" }
+    });
+  } finally {
+    cleanupCommandGuard(commandGuard);
+  }
 
   const stdout = String(result.stdout ?? "");
   const stderr = String(result.stderr ?? "");
@@ -446,7 +454,8 @@ export function runGrok(options = {}) {
     stdout,
     stderr,
     parsed,
-    ok
+    ok,
+    workerPolicy: summarizeWorkerPolicy(effectiveOptions.workerPolicy)
   };
 }
 
@@ -483,30 +492,177 @@ export function getStreamProgressHelperSource() {
 }
 
 /**
+ * Redact streamed tool events before they are persisted to a background job
+ * log. Tool output can contain entire source files, command output, or model
+ * context; logs retain only the tool name, file paths, and execution status.
+ *
+ * The function is deliberately self-contained because its source is embedded
+ * into the detached background worker.
+ */
+export function sanitizeStreamLogLine(line, toolCallContext = new Map()) {
+  const raw = String(line ?? "");
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+
+  let event;
+  try {
+    event = JSON.parse(trimmed);
+  } catch {
+    return raw;
+  }
+  if (!event || typeof event !== "object" || Array.isArray(event)) return raw;
+
+  const eventType = String(event.type ?? event.event ?? "").toLowerCase();
+  const toolCallId = String(
+    event.toolCallId ?? event.tool_call_id ?? event.callId ?? event.call_id ?? ""
+  );
+  const isToolEvent = eventType.includes("tool") || Boolean(
+    toolCallId && (
+      event.name || event.toolName || event.tool_name || event.tool ||
+      event.content || event.output || event.result
+    )
+  );
+  if (!isToolEvent) return raw;
+
+  const cleanToolName = (value) => {
+    const candidate = String(value ?? "").trim();
+    return /^[a-zA-Z0-9_.:-]{1,120}$/.test(candidate) ? candidate : "unknown";
+  };
+  const existing = toolCallId && typeof toolCallContext?.get === "function"
+    ? toolCallContext.get(toolCallId) ?? {}
+    : {};
+  const toolName = cleanToolName(
+    event.toolName ?? event.tool_name ?? event.name ?? event.tool?.name ??
+    event.toolCall?.name ?? event.tool_call?.name ?? event.function?.name ??
+    existing.toolName
+  );
+
+  const filePaths = [];
+  const seenPaths = new Set();
+  const addPath = (value) => {
+    for (const item of Array.isArray(value) ? value : [value]) {
+      if (typeof item !== "string") continue;
+      const candidate = item.trim();
+      if (!candidate || candidate.length > 2048 || seenPaths.has(candidate)) continue;
+      seenPaths.add(candidate);
+      filePaths.push(candidate);
+    }
+  };
+  const collectPaths = (value, depth = 0) => {
+    if (value == null || depth > 5) return;
+    if (typeof value === "string") {
+      const candidate = value.trim();
+      if ((candidate.startsWith("{") || candidate.startsWith("[")) && candidate.length < 65536) {
+        try {
+          collectPaths(JSON.parse(candidate), depth + 1);
+        } catch {}
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) collectPaths(item, depth + 1);
+      return;
+    }
+    if (typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+      if (/^(path|paths|file|files|filePath|filePaths|file_path|file_paths|filename|target_file|absolute_path)$/i.test(key)) {
+        addPath(child);
+      } else if (/^(input|rawInput|arguments|args|parameters|params|locations|tool|toolCall|tool_call|function)$/i.test(key)) {
+        collectPaths(child, depth + 1);
+      }
+    }
+  };
+  for (const source of [
+    event.input,
+    event.rawInput,
+    event.arguments,
+    event.args,
+    event.parameters,
+    event.params,
+    event.locations,
+    event.tool,
+    event.toolCall,
+    event.tool_call,
+    event.function
+  ]) {
+    collectPaths(source);
+  }
+  for (const priorPath of existing.filePaths ?? []) addPath(priorPath);
+
+  const rawStatus = String(event.status ?? event.state ?? "").trim().toLowerCase();
+  const allowedStatuses = new Set([
+    "queued", "pending", "started", "running", "in_progress", "completed",
+    "succeeded", "success", "failed", "error", "cancelled", "canceled"
+  ]);
+  let status = allowedStatuses.has(rawStatus) ? rawStatus : "unknown";
+  if (status === "unknown") {
+    if (/error|fail/.test(eventType)) status = "failed";
+    else if (/result|complete|finish/.test(eventType)) status = "completed";
+    else if (/start|create/.test(eventType)) status = "started";
+    else if (/update|delta/.test(eventType)) status = "running";
+  }
+
+  if (toolCallId && typeof toolCallContext?.set === "function") {
+    toolCallContext.set(toolCallId, { toolName, filePaths });
+  }
+  return JSON.stringify({ toolName, filePaths, status });
+}
+
+/** Source string interpolated into the background worker script. */
+export function getStreamLogSanitizerSource() {
+  return sanitizeStreamLogLine.toString();
+}
+
+/**
  * Build the Node `-e` script that runs a detached Grok process and streams
  * progress. Exported so tests can assert the progress helper is embedded.
  */
 export function buildGrokBackgroundWrapperSource({
   binary,
   args,
+  promptFile = "",
   resultFile,
   logFile = "",
   progressFile = "",
   cwd = process.cwd(),
-  streaming = false
+  streaming = false,
+  env = null,
+  commandGuardDir = ""
 }) {
   // Embed the same function the module exports (not a hand-maintained copy).
   const streamProgressHelper = getStreamProgressHelperSource();
+  const streamLogSanitizer = getStreamLogSanitizerSource();
   return `
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
+const nodePath = require("node:path");
 const binary = ${JSON.stringify(binary)};
 const args = ${JSON.stringify(args)};
+const promptFile = ${JSON.stringify(promptFile || "")};
 const resultFile = ${JSON.stringify(resultFile)};
 const logFile = ${JSON.stringify(logFile || "")};
 const progressFile = ${JSON.stringify(progressFile)};
 const cwd = ${JSON.stringify(cwd)};
 const streaming = ${JSON.stringify(streaming)};
+const childEnv = ${JSON.stringify(env || {})};
+const commandGuardDir = ${JSON.stringify(commandGuardDir || "")};
+
+function cleanupPromptFile() {
+  if (!promptFile) return;
+  try {
+    const resolved = nodePath.resolve(promptFile);
+    const parentDir = nodePath.dirname(resolved);
+    const parent = nodePath.basename(parentDir);
+    if (nodePath.basename(resolved) !== "prompt.md" || !parent.startsWith("grok-companion-")) return;
+    fs.rmSync(resolved, { force: true });
+    fs.rmSync(parentDir, { recursive: true, force: true });
+  } catch {}
+}
+
+function cleanupCommandGuard() {
+  if (!commandGuardDir) return;
+  try { fs.rmSync(commandGuardDir, { recursive: true, force: true }); } catch {}
+}
 
 function append(line) {
   if (!logFile) return;
@@ -536,8 +692,12 @@ writeProgress({ phase: "starting", message: "Launching Grok", lines: 0 });
 
 const child = spawn(binary, args, {
   cwd,
-  env: { ...process.env, RUST_LOG: process.env.RUST_LOG || "off" },
+  env: { ...childEnv, RUST_LOG: "off" },
   stdio: ["ignore", "pipe", "pipe"]
+});
+child.on("error", () => {
+  cleanupPromptFile();
+  cleanupCommandGuard();
 });
 
 let stdout = "";
@@ -549,6 +709,9 @@ let lineCount = 0;
 let lastMessage = "running";
 
 ${streamProgressHelper}
+${streamLogSanitizer}
+
+const toolLogContext = new Map();
 
 function handleStreamLine(line) {
   lineCount += 1;
@@ -588,26 +751,27 @@ let stdoutBuf = "";
 child.stdout.on("data", (chunk) => {
   const text = chunk.toString();
   stdout += text;
-  append(text.trimEnd());
-  if (streaming) {
-    stdoutBuf += text;
-    let idx;
-    while ((idx = stdoutBuf.indexOf("\\n")) !== -1) {
-      const line = stdoutBuf.slice(0, idx);
-      stdoutBuf = stdoutBuf.slice(idx + 1);
-      handleStreamLine(line);
-    }
+  stdoutBuf += text;
+  let idx;
+  while ((idx = stdoutBuf.indexOf("\\n")) !== -1) {
+    const line = stdoutBuf.slice(0, idx);
+    stdoutBuf = stdoutBuf.slice(idx + 1);
+    const sanitized = sanitizeStreamLogLine(line, toolLogContext);
+    if (sanitized) append(sanitized);
+    if (streaming) handleStreamLine(line);
   }
 });
 child.stderr.on("data", (chunk) => {
   const text = chunk.toString();
   stderr += text;
-  append("[stderr] " + text.trimEnd());
-  writeProgress({ phase: "running", message: text.trim().slice(0, 120), lines: lineCount });
+  append("[stderr] diagnostics emitted");
+  writeProgress({ phase: "running", message: "stderr diagnostics emitted", lines: lineCount });
 });
 child.on("close", (code, signal) => {
-  if (streaming && stdoutBuf.trim()) {
-    handleStreamLine(stdoutBuf);
+  if (stdoutBuf.trim()) {
+    const sanitized = sanitizeStreamLogLine(stdoutBuf, toolLogContext);
+    if (sanitized) append(sanitized);
+    if (streaming) handleStreamLine(stdoutBuf);
   }
 
   let finalStdout = stdout;
@@ -645,6 +809,8 @@ child.on("close", (code, signal) => {
   } catch (error) {
     append("Failed to write result: " + error.message);
   }
+  cleanupPromptFile();
+  cleanupCommandGuard();
   process.exit(code === null ? 1 : code);
 });
 `.trim();
@@ -660,32 +826,51 @@ export function spawnGrokBackground(options = {}) {
     throw new Error(availability.reason);
   }
 
-  const useStreaming = Boolean(options.progressFile);
-  const args = buildGrokArgs({
-    ...options,
-    outputFormat: useStreaming ? "streaming-json" : options.outputFormat ?? "json"
+  const effectiveOptions = normalizeWorkerPolicy(options, {
+    toolName: options.workerPolicy?.toolName || "grok-background",
+    writeCapable: options.write === true
   });
-  const resultFile = options.resultFile;
+  const useStreaming = Boolean(effectiveOptions.progressFile);
+  const args = buildGrokArgs({
+    ...effectiveOptions,
+    outputFormat: useStreaming ? "streaming-json" : effectiveOptions.outputFormat ?? "json"
+  });
+  const resultFile = effectiveOptions.resultFile;
   if (!resultFile) {
     throw new Error("resultFile is required for background runs");
   }
 
-  const wrapper = buildGrokBackgroundWrapperSource({
-    binary: availability.binary,
-    args,
-    resultFile,
-    logFile: options.logFile || "",
-    progressFile: options.progressFile || "",
-    cwd: options.cwd || process.cwd(),
-    streaming: useStreaming
-  });
+  const commandGuard = createCommandGuard();
+
+  let wrapper;
+  try {
+    wrapper = buildGrokBackgroundWrapperSource({
+      binary: availability.binary,
+      args,
+      resultFile,
+      promptFile: effectiveOptions.promptFile || "",
+      logFile: effectiveOptions.logFile || "",
+      progressFile: effectiveOptions.progressFile || "",
+      cwd: effectiveOptions.cwd || process.cwd(),
+      streaming: useStreaming,
+      env: prependCommandGuard(
+        buildWorkerEnv({ ...process.env, ...(effectiveOptions.env ?? {}) }, { grokBinary: availability.binary }),
+        commandGuard
+      ),
+      commandGuardDir: commandGuard
+    });
+  } catch (error) {
+    cleanupCommandGuard(commandGuard);
+    throw error;
+  }
 
   const child = spawn(process.execPath, ["-e", wrapper], {
-    cwd: options.cwd,
+    cwd: effectiveOptions.cwd,
     detached: true,
     stdio: "ignore",
-    env: process.env
+    env: buildWorkerEnv(process.env, { grokBinary: availability.binary })
   });
+  child.once("error", () => cleanupCommandGuard(commandGuard));
   child.unref();
   return { pid: child.pid, binary: availability.binary, args };
 }

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { runCommand } from "./process.mjs";
+import { buildWorkerEnv } from "./security.mjs";
 
 function encodeProjectDir(cwd) {
   // Claude Code stores projects as path with / replaced by -
@@ -87,7 +88,8 @@ export function buildTransferPlan(cwd, options = {}) {
   }
 
   // Probe whether grok import exists
-  const help = runCommand(options.grokBinary || "grok", ["help"]);
+  const grokBinary = options.grokBinary || "grok";
+  const help = runCommand(grokBinary, ["help"], { env: buildWorkerEnv(process.env, { grokBinary }) });
   const helpText = `${help.stdout || ""}\n${help.stderr || ""}`;
   const supportsImport = /\bimport\b/i.test(helpText);
 

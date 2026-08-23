@@ -302,9 +302,9 @@ export function preferPlanArtifactText(resultText, artifacts) {
 /**
  * Collect document artifacts (docx/pdf/pptx) into .grok-docs/.
  */
-export function collectDocumentArtifacts(cwd, { text = "", sessionId = null, jobId = null, sinceMs = null } = {}) {
+export function collectDocumentArtifacts(cwd, { text = "", sessionId = null, jobId = null, sinceMs = null, outputDir = null } = {}) {
   const artifacts = [];
-  const destDir = ensureProjectArtifactDir(cwd, ".grok-docs");
+  const destDir = outputDir ? path.resolve(cwd, outputDir) : ensureProjectArtifactDir(cwd, ".grok-docs");
   const exts = new Set([".docx", ".pdf", ".pptx", ".dotx"]);
   const candidates = [];
 

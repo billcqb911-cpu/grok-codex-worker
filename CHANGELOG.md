@@ -78,3 +78,12 @@
 
 ### Added
 - Initial Codex MCP plugin: setup, rescue, review, adversarial review, image, video, status, result, cancel, transfer.
+## Unreleased
+
+- Added Phase 7A permission and capability isolation.
+- Grok tasks now force the `strict` sandbox with `dontAsk`/`plan`, reject yolo, custom agents, memory, caller allow rules, unsafe permission/sandbox requests, and host-tool handoffs.
+- Documented Grok rules deny all Bash, Grok MCP, web-fetch, and web-search tools; Claude/Cursor compatibility discovery, subagents, workflows, telemetry, and memory are disabled in the child environment.
+- Grok child processes receive an explicit non-secret environment allowlist and temporary command guards for Codex, plugin, MCP, credential, remote-shell, and network CLIs.
+- Completion verification now requires valid structured worker-policy evidence in addition to Grok success, artifacts/files, actual SHA-256 changes, scope, and any requested check command.
+- Windows results explicitly report tool-policy/snapshot enforcement rather than claiming an undocumented Grok kernel sandbox.
+- Added redacted worker-policy evidence and MCP approval annotations; Codex remains the only host-tool principal.

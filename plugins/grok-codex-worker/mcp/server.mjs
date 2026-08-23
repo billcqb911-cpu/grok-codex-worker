@@ -5,10 +5,28 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
+import { buildWorkerEnv, isReadOnlyTool, normalizeWorkerPolicy } from "../scripts/lib/security.mjs";
 
-const SERVER_VERSION = "0.5.8";
+const SERVER_VERSION = "0.1.0";
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
-const COMPANION = path.join(ROOT_DIR, "scripts", "grok-companion.mjs");
+
+/**
+ * Resolve the companion from the MCP server install directory. MCP hosts
+ * may set process.cwd() to the active project, so a relative companion
+ * path is unsafe here, especially for detached jobs.
+ */
+export function resolveCompanionPath() {
+  const companion = path.resolve(ROOT_DIR, "scripts", "grok-companion.mjs");
+  if (!fs.existsSync(companion)) {
+    throw new Error(
+      "Grok companion module not found at " + companion + ". " +
+        "The plugin MCP server may be using a stale or incomplete install; restart Codex and reinstall the plugin."
+    );
+  }
+  return companion;
+}
+
+const COMPANION = resolveCompanionPath();
 
 const stringSchema = (description) => ({ type: "string", description });
 const booleanSchema = (description) => ({ type: "boolean", description });
@@ -40,10 +58,35 @@ const CONTROL_PROPERTIES = {
   },
   disableWebSearch: booleanSchema("Disable web search tools."),
   forkSession: booleanSchema("Fork the current Grok session."),
-  maxTurns: integerSchema("Maximum Grok turns for this job.")
+  maxTurns: integerSchema("Maximum Grok turns for this job."),
+  hostToolRequired: booleanSchema("Reject delegation when Codex-only plugins, MCP, browser, or credential actions are required.")
 };
 
+const CONTRACT_PROPERTIES = {
+  expectedFiles: {
+    type: "array",
+    items: { type: "string" },
+    description: "Files that must be actually added or modified after the job; existence alone is insufficient."
+  },
+  allowedChangedFiles: {
+    type: "array",
+    items: { type: "string" },
+    description: "Strict allowlist of files Grok may add, modify, or delete when a snapshot is enabled."
+  },
+  forbiddenChangedPaths: {
+    type: "array",
+    items: { type: "string" },
+    description: "Files or directories Grok must not change when a snapshot is enabled."
+  },
+  checkCommand: stringSchema("Optional command to run after Grok finishes; non-zero exit means the job failed its completion contract."),
+  checkPolicy: stringSchema("Check policy: on-success (default) or always."),
+  checkTimeoutMs: integerSchema("Maximum check command duration in milliseconds.", 100),
+  snapshot: booleanSchema("Capture a workspace snapshot before write-capable work."),
+  noSnapshot: booleanSchema("Disable the workspace snapshot for this job."),
+  rollbackOnFailure: booleanSchema("Restore the pre-job snapshot when the job fails its contract or check.")
+};
 const COMMON_JOB_PROPERTIES = {
+  ...CONTRACT_PROPERTIES,
   ...WORKSPACE_PROPERTY,
   background: booleanSchema("Start a background job and return the job id."),
   model: stringSchema("Grok model id or alias, such as fast or deep."),
@@ -70,7 +113,8 @@ const TOOL_DEFINITIONS = [
   },
   {
     name: "grok_rescue",
-    description: "Delegate investigation, implementation, or fixes to Grok. Write-capable by default.",
+    description: "Delegate one bounded, verifiable project-worker invocation to Grok. Codex-only plugins, MCP, browser, credentials, approvals, and external submissions remain on the Codex host; set hostToolRequired when delegation must be refused.",
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -107,6 +151,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "grok_review",
     description: "Run a structured read-only Grok review of the working tree, branch, or PR.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -123,6 +168,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "grok_adversarial_review",
     description: "Ask Grok to challenge a design, branch, working tree, or PR for hidden risks.",
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -401,6 +447,15 @@ function appendControlArgs(args, input) {
 function appendCommonJobArgs(args, input) {
   pushFlag(args, input.background, "--background");
   pushValue(args, input.model, "--model");
+  pushArray(args, input.expectedFiles, "--expected-file");
+  pushArray(args, input.allowedChangedFiles, "--allowed-changed-file");
+  pushArray(args, input.forbiddenChangedPaths, "--forbidden-changed-path");
+  pushValue(args, input.checkCommand, "--check-command");
+  pushValue(args, input.checkPolicy, "--check-policy");
+  pushValue(args, input.checkTimeoutMs, "--check-timeout-ms");
+  pushFlag(args, input.snapshot, "--snapshot");
+  pushFlag(args, input.noSnapshot, "--no-snapshot");
+  pushFlag(args, input.rollbackOnFailure, "--rollback-on-failure");
   pushValue(args, input.effort, "--effort");
   appendControlArgs(args, input);
   pushFlag(args, input.json, "--json");
@@ -470,6 +525,7 @@ export function buildCompanionInvocation(toolName, input = {}) {
       } else if (input.fresh) {
         args.push("--fresh");
       }
+
       pushValue(args, input.model, "--model");
       pushValue(args, input.effort, "--effort");
       if (input.worktreeName) {
@@ -480,6 +536,15 @@ export function buildCompanionInvocation(toolName, input = {}) {
       pushValue(args, input.worktreeRef, "--worktree-ref");
       pushFlag(args, input.check, "--check");
       pushValue(args, input.bestOfN, "--best-of-n");
+      pushArray(args, input.expectedFiles, "--expected-file");
+      pushArray(args, input.allowedChangedFiles, "--allowed-changed-file");
+      pushArray(args, input.forbiddenChangedPaths, "--forbidden-changed-path");
+      pushValue(args, input.checkCommand, "--check-command");
+      pushValue(args, input.checkPolicy, "--check-policy");
+      pushValue(args, input.checkTimeoutMs, "--check-timeout-ms");
+      pushFlag(args, input.snapshot, "--snapshot");
+      pushFlag(args, input.noSnapshot, "--no-snapshot");
+      pushFlag(args, input.rollbackOnFailure, "--rollback-on-failure");
       pushFlag(args, input.verbatim, "--verbatim");
       appendControlArgs(args, input);
       pushFlag(args, input.json, "--json");
@@ -644,13 +709,24 @@ export function buildCompanionInvocation(toolName, input = {}) {
 }
 
 export function runCompanion(toolName, input = {}) {
-  const { args } = buildCompanionInvocation(toolName, input);
   const cwd = resolveMcpCwd(input);
+  const writeCapable = !isReadOnlyTool(toolName, input) &&
+    !(toolName === "grok_workflow" && input.action === "list") &&
+    !(toolName === "grok_execute_plan" && input.dryRun === true);
+  const policyInput = normalizeWorkerPolicy({
+    ...input,
+    cwd,
+    planMode: input.planMode === true || toolName === "grok_plan"
+  }, { toolName, writeCapable });
+  const { args } = buildCompanionInvocation(toolName, policyInput);
+  // Resolve again at call time so a partially removed cache fails with a
+  // precise diagnostic instead of Node generic MODULE_NOT_FOUND output.
+  const companion = resolveCompanionPath();
 
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [COMPANION, ...args], {
+    const child = spawn(process.execPath, [companion, ...args], {
       cwd,
-      env: process.env,
+      env: buildWorkerEnv(process.env),
       stdio: ["ignore", "pipe", "pipe"]
     });
 
@@ -707,7 +783,7 @@ async function handleRequest(message) {
           result: {
             protocolVersion: message.params?.protocolVersion || "2024-11-05",
             capabilities: { tools: {} },
-            serverInfo: { name: "grok-in-codex", version: SERVER_VERSION }
+            serverInfo: { name: "grok-codex-worker", version: SERVER_VERSION }
           }
         };
       case "tools/list":

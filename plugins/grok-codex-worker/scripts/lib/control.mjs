@@ -20,7 +20,8 @@ export const CONTROL_BOOLEAN_OPTIONS = [
   "disable-web-search",
   "fork-session",
   "memory",
-  "no-memory"
+  "no-memory",
+  "host-tool-required"
 ];
 
 /** Shared parseArgs value option names for control surface */

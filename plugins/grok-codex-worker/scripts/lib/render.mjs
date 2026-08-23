@@ -131,6 +131,43 @@ function appendResultEnrichment(lines, payload) {
     }
   }
 
+  if (payload.contract) {
+    lines.push("", "## Completion contract", "");
+    lines.push(`- **Verified**: ${payload.contract.verified ? "yes" : "no"}`);
+    if (payload.contract.policy) {
+      lines.push(`- **Worker policy**: ${payload.contract.policy.ok ? "passed" : "failed"} (v${payload.contract.policy.policyVersion ?? "?"})`);
+    }
+    if (payload.contract.expectedFiles?.length) lines.push(`- **Expected files**: ${payload.contract.expectedFiles.join(", ")}`);
+    if (payload.contract.missingFiles?.length) lines.push(`- **Missing files**: ${payload.contract.missingFiles.join(", ")}`);
+    if (payload.contract.checkCommand) lines.push(`- **Check command**: \`${payload.contract.checkCommand}\` (${payload.contract.check?.ok ? "passed" : "failed"})`);
+    if (payload.contract.expectedArtifactDir) lines.push(`- **Artifact directory**: \`${payload.contract.expectedArtifactDir}\``);
+    if (payload.contract.allowedChangedFiles?.length) lines.push(`- **Allowed changed files**: ${payload.contract.allowedChangedFiles.join(", ")}`);
+    if (payload.contract.forbiddenChangedPaths?.length) lines.push(`- **Forbidden changed paths**: ${payload.contract.forbiddenChangedPaths.join(", ")}`);
+    if (payload.contract.scope && !payload.contract.scope.ok) lines.push(`- **Scope violations**: ${payload.contract.scope.violations.join(", ")}`);
+    if (payload.contract.actualChange) {
+      lines.push("- **Actual change contract**: " + (payload.contract.actualChange.ok ? "passed" : "failed"));
+      lines.push("- **Hash algorithm**: " + (payload.contract.actualChange.hashAlgorithm || "sha256"));
+      if (payload.contract.actualChange.missingExpectedFiles?.length) lines.push("- **Expected files not changed**: " + payload.contract.actualChange.missingExpectedFiles.join(", "));
+      if (payload.contract.actualChange.zeroChange) lines.push("- **Failure**: write-capable task produced zero workspace changes.");
+    }
+  }
+  if (payload.snapshot) {
+    lines.push("", "## Workspace snapshot", "");
+    lines.push(`- **Manifest**: \`${payload.snapshot.manifestPath || payload.snapshot.dir || "(unavailable)"}\``);
+  }
+  if (payload.changes) {
+    const counts = payload.changes.counts || {};
+    lines.push("", "## Workspace changes", "");
+    lines.push(`- **Added**: ${counts.added || 0} · **Modified**: ${counts.modified || 0} · **Deleted**: ${counts.deleted || 0}`);
+    for (const item of payload.changes.added || []) lines.push(`- Added: \`${item.path}\``);
+    for (const item of payload.changes.modified || []) lines.push(`- Modified: \`${item.after?.path || item.before?.path}\``);
+    for (const item of payload.changes.deleted || []) lines.push(`- Deleted: \`${item.path}\``);
+  }
+  if (payload.rollback) {
+    lines.push("", "## Rollback", "");
+    lines.push(`- **Status**: ${payload.rollback.ok ? "completed" : "failed"}`);
+    if (payload.rollback.error) lines.push(`- **Error**: ${payload.rollback.error}`);
+  }
   if (payload.artifacts?.length) {
     lines.push("");
     lines.push("## Artifacts");
@@ -232,9 +269,9 @@ export function renderTaskResult(payload) {
   } else if (payload.kind === "plan" || payload.config?.planMode) {
     lines.push("- **Mode**: plan (`--permission-mode plan`)");
   } else if (payload.write) {
-    lines.push("- **Mode**: write-capable (`--yolo`)");
+    lines.push("- **Mode**: bounded write (`strict` sandbox + `dontAsk` + workspace Edit/Write rules)");
   } else {
-    lines.push("- **Mode**: read-only (denylist)");
+    lines.push("- **Mode**: bounded read-only (`strict` sandbox; shell/MCP/web/edit denied)");
   }
   appendResultEnrichment(lines, payload);
   lines.push("");
@@ -357,6 +394,16 @@ export function renderStatusReport(jobs, options = {}) {
     if (primary.length) {
       lines.push(`- **Artifacts**: ${primary.map((p) => `\`${p}\``).join(", ")}`);
     }
+    if (job.snapshot) {
+      lines.push(`- **Snapshot**: \`${job.snapshot.manifestPath || job.snapshot.dir || "(unavailable)"}\``);
+    }
+    if (job.changes) {
+      const counts = job.changes.counts || {};
+      lines.push(`- **Changes**: +${counts.added || 0} / ~${counts.modified || 0} / -${counts.deleted || 0}`);
+    }
+    if (job.rollback) {
+      lines.push(`- **Rollback**: ${job.rollback.ok ? "completed" : "failed"}${job.rollback.error ? ` — ${job.rollback.error}` : ""}`);
+    }
     if (job.logFile) {
       lines.push(`- **Log**: \`${job.logFile}\``);
     }
@@ -435,7 +482,11 @@ export function renderStoredJobResult(job) {
     postPending: job.postPending || null,
     bestOfN: job.bestOfN ?? job.config?.bestOfN,
     worktree: job.worktree ?? job.config?.worktree,
-    check: job.check ?? job.config?.check
+    check: job.check ?? job.config?.check,
+    contract: job.contract || null,
+    snapshot: job.snapshot || null,
+    changes: job.changes || null,
+    rollback: job.rollback || null
   });
 }
 

@@ -6,7 +6,7 @@ user-invocable: false
 
 # Grok Runtime
 
-Use through the Grok MCP tools. If MCP is unavailable, call the companion directly with `node plugins/grok/scripts/grok-companion.mjs <command> ...`.
+Use through the Grok MCP tools. If MCP is unavailable, call the companion directly with `node plugins/grok-codex-worker/scripts/grok-companion.mjs <command> ...`.
 
 Recommended Grok CLI version: **≥ 0.2.118**.
 
@@ -33,20 +33,20 @@ MCP input keys map to companion flags:
 | `sandbox` | `--sandbox` |
 | `planMode` | `--plan` |
 | `permissionMode` | `--permission-mode` |
-| `agent` | `--agent` |
 | `noSubagents` | `--no-subagents` |
-| `memory` / `noMemory` | `--memory` / `--no-memory` |
-| `allow` / `deny` | `--allow` / `--deny` (repeatable) |
+| `deny` | `--deny` (repeatable; only narrows the worker) |
 | `disableWebSearch` | `--disable-web-search` |
 | `forkSession` | `--fork-session` |
 | `maxTurns` | `--max-turns` |
 
 ## CLI posture
 
-- Prefer **denylist** (`--disallowed-tools`) over tools allowlist (Grok session-create bugs).
-- Media: no yolo / no tools allowlist.
-- `--dry-run` / `--validate-only` / babysit `list`: **read-only** (no yolo).
-- Write-capable default for rescue/design/execute/babysit add|check|remove.
+- The runtime always reapplies the Phase 7 policy at the lowest launch layer.
+- Effective sandbox is `strict`; permission mode is `dontAsk` or `plan`.
+- `Bash(*)`, `MCPTool(*)`, `WebFetch`, and `WebSearch` are always denied.
+- Caller allow rules, custom agents, memory, subagents, and yolo/always-approve are rejected.
+- Write tools are allowed only for the resolved workspace; write jobs require a SHA-256 snapshot.
+- `--dry-run` / `--validate-only` / babysit `list` additionally deny Edit/Write.
 
 ## Depth notes
 
@@ -54,7 +54,7 @@ MCP input keys map to companion flags:
 - Design/workflow/plan/document jobs harvest copies into `.grok-designs/` / `.grok-workflows/` / `.grok-plans/` / `.grok-docs/`.
 - Review `postPending=true`: skips empty findings; empty/oversize diffs fail closed and save findings under `.grok-reviews/`.
 - Plan results prefer harvested `plan.md` body over narration.
-- Stop-gate uses sandbox `read-only` + denylist (no yolo).
+- Stop-gate uses the strict sandbox and the read-only deny policy.
 
 ## State env
 

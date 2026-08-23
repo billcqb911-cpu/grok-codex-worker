@@ -12,6 +12,9 @@ const GROK_STATE_ENV = "GROK_CODEX_PLUGIN_STATE";
 const FALLBACK_STATE_ROOT = path.join(os.homedir(), ".grok", "codex-plugin", "state");
 const MAX_JOBS = 50;
 const MAX_TASK_SESSIONS = 20;
+const STATE_LOCK_TIMEOUT_MS = 10_000;
+const STATE_LOCK_STALE_MS = 60_000;
+const STATE_LOCK_POLL_MS = 25;
 
 /**
  * Only trust CODEX_PLUGIN_DATA when it clearly belongs to *this* grok plugin.
@@ -179,6 +182,56 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
+function sleepSync(milliseconds) {
+  const buffer = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(buffer), 0, 0, milliseconds);
+}
+
+function stateLockPath(cwd) {
+  return `${resolveStateFile(cwd)}.lock`;
+}
+
+function acquireStateLock(cwd) {
+  ensureStateDir(cwd);
+  const lockPath = stateLockPath(cwd);
+  const token = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+  const started = Date.now();
+  while (true) {
+    try {
+      const fd = fs.openSync(lockPath, "wx");
+      fs.writeFileSync(fd, `${token}\n`, "utf8");
+      return { fd, lockPath, token };
+    } catch (error) {
+      if (error?.code !== "EEXIST") throw error;
+      try {
+        const stat = fs.statSync(lockPath);
+        if (Date.now() - stat.mtimeMs > STATE_LOCK_STALE_MS) {
+          fs.rmSync(lockPath, { force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+      if (Date.now() - started >= STATE_LOCK_TIMEOUT_MS) {
+        throw new Error(`Timed out waiting for Grok state lock: ${lockPath}`);
+      }
+      sleepSync(STATE_LOCK_POLL_MS);
+    }
+  }
+}
+
+function releaseStateLock(lock) {
+  if (!lock) return;
+  try {
+    fs.closeSync(lock.fd);
+  } catch {}
+  try {
+    if (fs.readFileSync(lock.lockPath, "utf8").trim() === lock.token) {
+      fs.rmSync(lock.lockPath, { force: true });
+    }
+  } catch {}
+}
+
 export function loadState(cwd) {
   const stateFile = resolveStateFile(cwd);
   if (!fs.existsSync(stateFile)) {
@@ -214,7 +267,7 @@ function pruneTaskSessions(sessions) {
     .slice(0, MAX_TASK_SESSIONS);
 }
 
-export function saveState(cwd, state) {
+function saveStateUnlocked(cwd, state) {
   ensureStateDir(cwd);
   const next = {
     version: STATE_VERSION,
@@ -226,14 +279,52 @@ export function saveState(cwd, state) {
     },
     jobs: pruneJobs(state.jobs ?? [])
   };
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  const stateFile = resolveStateFile(cwd);
+  const temporary = `${stateFile}.tmp.${process.pid}.${Math.random().toString(36).slice(2)}`;
+  fs.writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+  try {
+    fs.renameSync(temporary, stateFile);
+  } catch (error) {
+    // A reader or antivirus can briefly hold the destination on Windows.
+    // Retry the atomic replacement, but never delete the old state as a
+    // fallback: a failed update must not create an empty state-file window.
+    if (error?.code !== "EEXIST" && error?.code !== "EPERM") throw error;
+    let replaced = false;
+    for (let attempt = 0; attempt < 3 && !replaced; attempt += 1) {
+      sleepSync(STATE_LOCK_POLL_MS);
+      try {
+        fs.renameSync(temporary, stateFile);
+        replaced = true;
+      } catch (retryError) {
+        if (retryError?.code !== "EEXIST" && retryError?.code !== "EPERM") throw retryError;
+        error = retryError;
+      }
+    }
+    if (!replaced) throw error;
+  } finally {
+    if (fs.existsSync(temporary)) fs.rmSync(temporary, { force: true });
+  }
   return next;
 }
 
+export function saveState(cwd, state) {
+  const lock = acquireStateLock(cwd);
+  try {
+    return saveStateUnlocked(cwd, state);
+  } finally {
+    releaseStateLock(lock);
+  }
+}
+
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  const lock = acquireStateLock(cwd);
+  try {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveStateUnlocked(cwd, state);
+  } finally {
+    releaseStateLock(lock);
+  }
 }
 
 export function getConfig(cwd) {

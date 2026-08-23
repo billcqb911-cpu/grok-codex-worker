@@ -27,6 +27,16 @@ user-invocable: false
 - Tiny edits with obvious answers
 - Pure conversation without repo mutation
 
+## Host capability boundary
+
+- Codex remains the only principal that may call other Codex plugins/MCP tools,
+  browsers, connectors, credentials, logins, uploads, or external submissions.
+- If a task requires one of those capabilities, keep that step in Codex and pass
+  only the minimum sanitized result to Grok. Set `hostToolRequired=true` on the
+  Grok handoff when the worker must refuse delegation.
+- Grok is a bounded project worker, not a recursive Codex agent. Its process does
+  not receive the Codex MCP registry or user approval handles.
+
 ## Intent → tool
 
 | User intent | Prefer |
@@ -54,11 +64,15 @@ Prefer this sequence over a single giant rescue:
 
 Use **`grok_workflow`** when you have a named multi-agent recipe (fan-out review dimensions, etc.), not ad-hoc parallel rescues.
 
-## Memory and agent profiles
+## Bounded execution profiles
 
-- Long multi-session work: prefer `memory=true` so Grok can reuse decisions.
-- Codebase map / investigation without edits: `agent=explore` or `readOnly=true` + `sandbox=read-only`.
+- Codebase map / investigation without edits: `readOnly=true`; the worker forces
+  the strict sandbox and denies Edit, Write, Bash, MCP, and web tools.
 - Planning only: `grok_plan` or `planMode=true` on rescue.
+- Custom agents, cross-session memory, subagents, caller allow rules, and
+  always-approve modes are outside the worker boundary and are rejected.
+- Grok cannot run a shell test command. Put the command in `checkCommand`; the
+  Codex-side companion runs it after Grok returns and verifies the result.
 
 ## Parallel jobs
 

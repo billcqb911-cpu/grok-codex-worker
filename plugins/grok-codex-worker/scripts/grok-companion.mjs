@@ -28,6 +28,8 @@ import {
   controlToJobConfig
 } from "./lib/control.mjs";
 import { buildDesignPrompt, buildExecutePlanPrompt, buildPlanModePrompt } from "./lib/design.mjs";
+import { createWorkspaceSnapshot, buildWorkspaceChangeSet, rollbackWorkspaceSnapshot } from "./lib/snapshot.mjs";
+import { appendCompletionContract, describeContract, evaluateActualChangeContract, evaluateChangedFileScope, normalizeCheckPolicy, normalizeCheckTimeout, normalizeExpectedFiles, shellCommandForPlatform, validateSnapshotContract, verifyExpectedFiles, verifyProducedArtifacts } from "./lib/contracts.mjs";
 import { buildDocumentPrompt, normalizeDocumentType } from "./lib/documents.mjs";
 import { collectStopGateContext, resolveReviewTarget } from "./lib/git.mjs";
 import {
@@ -55,6 +57,7 @@ import {
   resolveJobLogFile,
   resolveJobPidFile,
   resolveJobProgressFile,
+  resolveJobsDir,
   setConfig,
   shouldAttemptBackgroundFinalize,
   tailLog,
@@ -95,6 +98,7 @@ import {
   parseWorkflowArgs
 } from "./lib/workflow.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { normalizeWorkerPolicy, buildWorkerEnv, evaluateWorkerPolicy, summarizeWorkerPolicy } from "./lib/security.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const VALID_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -107,6 +111,10 @@ const MODEL_ALIASES = new Map([
 const PRESET_EFFORT = new Map([
   ["deep", "high"]
 ]);
+const CONTRACT_BOOLEAN_OPTIONS = ["snapshot", "no-snapshot", "rollback-on-failure"];
+const CONTRACT_ARRAY_OPTIONS = ["expected-file", "allowed-changed-file", "forbidden-changed-path"];
+const CONTRACT_VALUE_OPTIONS = ["check-command", "check-policy", "check-timeout-ms"];
+
 
 function printUsage() {
   console.log(
@@ -149,17 +157,17 @@ function controlParseConfig(extraBoolean = [], extraValue = []) {
       "background",
       "json",
       "verbatim",
-      ...CONTROL_BOOLEAN_OPTIONS,
+      ...CONTROL_BOOLEAN_OPTIONS, ...CONTRACT_BOOLEAN_OPTIONS,
       ...extraBoolean
     ],
     valueOptions: [
       "model",
       "effort",
       "cwd",
-      ...CONTROL_VALUE_OPTIONS,
+      ...CONTROL_VALUE_OPTIONS, ...CONTRACT_VALUE_OPTIONS,
       ...extraValue
     ],
-    arrayOptions: [...CONTROL_ARRAY_OPTIONS]
+    arrayOptions: [...CONTROL_ARRAY_OPTIONS, ...CONTRACT_ARRAY_OPTIONS]
   };
 }
 
@@ -199,6 +207,26 @@ function normalizeEffort(effort, modelAlias) {
   return normalized === "max" ? "xhigh" : normalized;
 }
 
+function completionOptions(cwd, options, writeCapable) {
+  const noSnapshot = options["no-snapshot"] === true;
+  const snapshot = options.snapshot === true ? true : noSnapshot ? false : Boolean(writeCapable);
+  const allowedChangedFiles = normalizeExpectedFiles(cwd, options["allowed-changed-file"] || []);
+  const forbiddenChangedPaths = normalizeExpectedFiles(cwd, options["forbidden-changed-path"] || []);
+  validateSnapshotContract({
+    writeCapable, snapshot, noSnapshot, allowedChangedFiles, forbiddenChangedPaths,
+    rollbackOnFailure: Boolean(options["rollback-on-failure"])
+  });
+  return {
+    expectedFiles: normalizeExpectedFiles(cwd, options["expected-file"] || []),
+    allowedChangedFiles,
+    forbiddenChangedPaths,
+    checkCommand: options["check-command"] ? String(options["check-command"]) : null,
+    checkPolicy: normalizeCheckPolicy(options["check-policy"]),
+    checkTimeoutMs: normalizeCheckTimeout(options["check-timeout-ms"]),
+    snapshot,
+    rollbackOnFailure: Boolean(options["rollback-on-failure"])
+  };
+}
 function titleFromPrompt(prompt, fallback = "Grok task") {
   const compact = String(prompt ?? "")
     .replace(/\s+/g, " ")
@@ -214,6 +242,22 @@ function writePromptFile(content) {
   const filePath = path.join(dir, "prompt.md");
   fs.writeFileSync(filePath, content, "utf8");
   return filePath;
+}
+
+// Prompt files contain the full handoff, so remove only the companion-owned
+// temporary directory after the child has consumed it. Never remove a caller's
+// arbitrary prompt path.
+function cleanupPromptFile(promptFile) {
+  if (!promptFile) return;
+  try {
+    const resolved = path.resolve(String(promptFile));
+    const parent = path.dirname(resolved);
+    if (path.basename(resolved) !== "prompt.md" || !path.basename(parent).startsWith("grok-companion-")) {
+      return;
+    }
+    fs.rmSync(resolved, { force: true });
+    fs.rmSync(parent, { recursive: true, force: true });
+  } catch {}
 }
 
 function enrichJob(cwd, job) {
@@ -259,25 +303,139 @@ function harvestKindArtifacts(cwd, job, text, sessionId) {
       text,
       sessionId,
       jobId: job.id,
-      sinceMs: startedMs
+      sinceMs: startedMs,
+      outputDir: job.mediaDir || null
     });
   }
   const paths = extractArtifactPaths(text, job.workspaceRoot || cwd);
   return paths.map((p) => (typeof p === "string" ? { kind: "file", path: p } : p));
 }
 
+function evaluateCompletionContract(cwd, job, artifacts, { grokOk = true } = {}) {
+  const fileCheck = verifyExpectedFiles(cwd, job.expectedFiles || []);
+  const artifactCheck = verifyProducedArtifacts(cwd, job, artifacts);
+  let commandCheck = null;
+  const checkPolicy = job.checkPolicy || "on-success";
+  if (job.checkCommand && (grokOk || checkPolicy === "always")) {
+    const spec = shellCommandForPlatform(job.checkCommand);
+    let result;
+    try {
+      result = runCommand(spec.command, spec.args, {
+        cwd,
+        maxBuffer: 8 * 1024 * 1024,
+        timeout: job.checkTimeoutMs || 120000,
+        env: buildWorkerEnv(process.env)
+      });
+    } finally {
+      spec.cleanup?.();
+    }
+    const timedOut = result.error?.code === "ETIMEDOUT";
+    commandCheck = {
+      command: job.checkCommand,
+      exitCode: result.status,
+      ok: result.status === 0 && !result.error,
+      timedOut,
+      error: result.error ? String(result.error.message || result.error) : null,
+      stdout: String(result.stdout || "").trim().slice(-4000),
+      stderr: String(result.stderr || "").trim().slice(-4000)
+    };
+  }
+  const policyCheck = evaluateWorkerPolicy(job.workerPolicy, { writeRequested: Boolean(job.write) });
+  const contract = describeContract(job, artifactCheck, fileCheck, commandCheck, { grokOk, policyCheck });
+  if (!policyCheck.ok) return { status: "failed_policy", failure: policyCheck.message, contract };
+  if (!fileCheck.ok) return { status: "failed_artifact", failure: fileCheck.message, contract };
+  if (!artifactCheck.ok) return { status: "failed_artifact", failure: artifactCheck.message, contract };
+  if (commandCheck && !commandCheck.ok) {
+    const failure = commandCheck.timedOut
+      ? `Completion check timed out after ${job.checkTimeoutMs || 120000}ms: ${job.checkCommand}`
+      : `Completion check failed (exit ${commandCheck.exitCode ?? "unknown"}): ${job.checkCommand}`;
+    return { status: "failed_check", failure, contract };
+  }
+  if (!grokOk) return { status: "failed", failure: null, contract };
+  return { status: "completed", failure: null, contract };
+}
+
+function applyWorkspaceOutcome(cwd, job, initialStatus, initialFailure = null) {
+  const snapshotRequested = Boolean(job.snapshotRequested || (job.snapshot && typeof job.snapshot === "object"));
+  if (!snapshotRequested) {
+    const actualChange = evaluateActualChangeContract(cwd, job, null);
+    if (!actualChange.ok) {
+      return { status: actualChange.status || "failed_snapshot", snapshot: null, changes: null, actualChange, scope: null, rollback: null, failure: actualChange.message };
+    }
+    return { status: initialStatus, snapshot: null, changes: null, actualChange, scope: null, rollback: null, failure: null };
+  }
+  if (!job.snapshot || typeof job.snapshot !== "object") {
+    return { status: "failed_snapshot", snapshot: null, changes: null, actualChange: { ok: false, status: "failed_snapshot", message: "Workspace snapshot was requested but was not created." }, scope: null, rollback: null, failure: "Workspace snapshot was requested but was not created." };
+  }
+  let changes;
+  try {
+    changes = buildWorkspaceChangeSet(cwd, job.snapshot);
+  } catch (error) {
+    return { status: "failed_snapshot", snapshot: job.snapshot, changes: null, actualChange: { ok: false, status: "failed_snapshot", message: error instanceof Error ? error.message : String(error) }, scope: null, rollback: null, failure: "Unable to build workspace change set: " + (error instanceof Error ? error.message : String(error)) };
+  }
+  const actualChange = evaluateActualChangeContract(cwd, job, changes);
+  const scope = evaluateChangedFileScope(cwd, changes, { allowedChangedFiles: job.allowedChangedFiles || [], forbiddenChangedPaths: job.forbiddenChangedPaths || [] });
+  if (!scope.ok) {
+    if (initialStatus === "completed") {
+      initialStatus = "failed_scope";
+      initialFailure = scope.message;
+    } else if (initialStatus === "failed_check") {
+      initialStatus = "failed_scope_and_check";
+      initialFailure = scope.message + " Completion check also failed.";
+    } else if (initialStatus === "failed_artifact") {
+      initialStatus = "failed_scope_and_artifact";
+      initialFailure = scope.message + " Required artifact verification also failed.";
+    }
+  }
+  if (!actualChange.ok) {
+    if (initialStatus === "completed") {
+      initialStatus = actualChange.status || "failed_changes";
+      initialFailure = actualChange.message;
+    } else {
+      initialStatus = initialStatus + "_and_changes";
+      initialFailure = [initialFailure, actualChange.message].filter(Boolean).join(" ");
+    }
+  }
+  if (initialStatus === "completed" || !job.rollbackOnFailure) {
+    return { status: initialStatus, snapshot: job.snapshot, changes, actualChange, scope, rollback: null, failure: initialStatus !== "completed" ? initialFailure : null };
+  }
+  try {
+    const rollback = rollbackWorkspaceSnapshot(cwd, job.snapshot, changes);
+    const remainingChanges = buildWorkspaceChangeSet(cwd, job.snapshot);
+    rollback.remainingChanges = remainingChanges.counts;
+    if (
+      Object.values(remainingChanges.counts).some((count) => count > 0) ||
+      remainingChanges.unverifiedChanges?.length
+    ) {
+      rollback.ok = false;
+      rollback.error = "Rollback verification found remaining workspace changes.";
+      return { status: "failed_rollback", snapshot: job.snapshot, changes, actualChange, scope, rollback, failure: (initialFailure || initialStatus) + "; " + rollback.error };
+    }
+    const rolledBackStatus = initialStatus + "_rolled_back";
+    return { status: rolledBackStatus, snapshot: job.snapshot, changes, actualChange, scope, rollback, failure: (initialFailure || initialStatus) + " after Grok work; workspace changes were rolled back." };
+  } catch (error) {
+    return { status: "failed_rollback", snapshot: job.snapshot, changes, actualChange, scope, rollback: { ok: false, error: error instanceof Error ? error.message : String(error) }, failure: (initialFailure || initialStatus) + "; workspace rollback failed: " + (error instanceof Error ? error.message : String(error)) };
+  }
+}
 function finalizeJob(cwd, job, grokResult, extras = {}) {
+  if (!job.workerPolicy && grokResult.workerPolicy) {
+    job = { ...job, workerPolicy: summarizeWorkerPolicy(grokResult.workerPolicy) };
+  }
   const parsed = grokResult.parsed;
   const ok = grokResult.ok;
   const text = parsed?.text || (!ok ? parsed?.error || grokResult.stderr : "") || grokResult.stdout;
   const sessionId = parsed?.sessionId ?? null;
-  const status = ok ? "completed" : "failed";
+  let status = ok ? "completed" : "failed";
   const finishedAt = nowIso();
   const review = extras.parseReview ? tryParseStructuredReview(text) : null;
   let artifacts =
     extras.artifacts ||
     harvestKindArtifacts(cwd, job, text, sessionId);
   artifacts = normalizeArtifactList(artifacts);
+  const contractResult = evaluateCompletionContract(cwd, job, artifacts, { grokOk: ok });
+  status = ok ? contractResult.status : "failed";
+  const workspaceOutcome = applyWorkspaceOutcome(cwd, job, status, contractResult.failure);
+  status = workspaceOutcome.status;
 
   const usage =
     extractUsageFromParsed(parsed?.parsed || parsed) ||
@@ -288,14 +446,15 @@ function finalizeJob(cwd, job, grokResult, extras = {}) {
     ? `${review.verdict}: ${titleFromPrompt(review.summary, status)}`
     : titleFromPrompt(text, status);
 
-  const error = ok
-    ? null
+  const baseError = ok
+    ? contractResult.failure
     : humanizeGrokFailure({
         parsedError: parsed?.error,
         stderr: grokResult.stderr,
         stdout: grokResult.stdout,
         exitCode: grokResult.status
       });
+  const error = workspaceOutcome.failure || baseError;
 
   // Attach flags so post helper can see request even if only extras carried them.
   const jobForPost = {
@@ -339,7 +498,16 @@ function finalizeJob(cwd, job, grokResult, extras = {}) {
     grokSessionId: sessionId,
     exitCode: grokResult.status,
     error,
-    stderr: grokResult.stderr || null
+    stderr: grokResult.stderr || null,
+    contract: {
+      ...contractResult.contract,
+      actualChange: workspaceOutcome.actualChange || null,
+      scope: workspaceOutcome.scope,
+      verified: Boolean(contractResult.contract?.verified && (workspaceOutcome.actualChange?.ok ?? true) && (workspaceOutcome.scope?.ok ?? true))
+    },
+    snapshot: workspaceOutcome.snapshot,
+    changes: workspaceOutcome.changes,
+    rollback: workspaceOutcome.rollback
   };
 
   upsertJob(cwd, {
@@ -409,13 +577,17 @@ function maybeFinalizeBackgroundJob(cwd, job) {
   const ok = payload.exitCode === 0 && parsed.ok;
   const text = parsed.text || parsed.error || payload.stdout || "";
   const sessionId = parsed.sessionId ?? payload.sessionId ?? null;
-  const status = ok ? "completed" : "failed";
+  let status = ok ? "completed" : "failed";
   const finishedAt = payload.finishedAt || nowIso();
   const review =
     job.kind === "review" || job.kind === "adversarial-review" || job.kind === "stop-gate"
       ? tryParseStructuredReview(text)
       : null;
   const artifacts = normalizeArtifactList(harvestKindArtifacts(cwd, job, text, sessionId));
+  const contractResult = evaluateCompletionContract(cwd, job, artifacts, { grokOk: ok });
+  status = ok ? contractResult.status : "failed";
+  const workspaceOutcome = applyWorkspaceOutcome(cwd, job, status, contractResult.failure);
+  status = workspaceOutcome.status;
   // Prefer plan.md body for plan jobs so /grok:result is useful after background.
   const resultText =
     job.kind === "plan" ? preferPlanArtifactText(text, artifacts) : text;
@@ -424,14 +596,15 @@ function maybeFinalizeBackgroundJob(cwd, job) {
     extractUsageFromStdout(payload.stdout) ||
     null;
 
-  const error = ok
-    ? null
+  const baseError = ok
+    ? contractResult.failure
     : humanizeGrokFailure({
         parsedError: parsed.error,
         stderr: payload.stderr,
         stdout: payload.stdout,
         exitCode: payload.exitCode
       });
+  const error = workspaceOutcome.failure || baseError;
 
   const jobForPost = {
     ...job,
@@ -475,6 +648,15 @@ function maybeFinalizeBackgroundJob(cwd, job) {
     exitCode: payload.exitCode,
     error,
     stderr: payload.stderr || null,
+    contract: {
+      ...contractResult.contract,
+      actualChange: workspaceOutcome.actualChange || null,
+      scope: workspaceOutcome.scope,
+      verified: Boolean(contractResult.contract?.verified && (workspaceOutcome.actualChange?.ok ?? true) && (workspaceOutcome.scope?.ok ?? true))
+    },
+    snapshot: workspaceOutcome.snapshot,
+    changes: workspaceOutcome.changes,
+    rollback: workspaceOutcome.rollback,
     pendingResult: false
   };
 
@@ -510,6 +692,16 @@ function createJobShell(cwd, { kind, title, prompt, write, model, effort, extras
   const resultFile = path.join(path.dirname(logFile), `${jobId}.result.json`);
   const progressFile = resolveJobProgressFile(cwd, jobId);
   const promptFile = writePromptFile(prompt);
+  const snapshotRequested = Boolean(extras.snapshot);
+  let snapshot;
+  try {
+    snapshot = snapshotRequested
+      ? createWorkspaceSnapshot(cwd, { jobId, stateDir: resolveJobsDir(cwd) })
+      : null;
+  } catch (error) {
+    cleanupPromptFile(promptFile);
+    throw error;
+  }
   const job = {
     id: jobId,
     schemaVersion: 3,
@@ -529,34 +721,65 @@ function createJobShell(cwd, { kind, title, prompt, write, model, effort, extras
     promptFile,
     usage: null,
     artifacts: [],
-    ...extras
+    ...extras,
+    snapshotRequested,
+    snapshot
   };
 
-  upsertJob(cwd, {
-    id: jobId,
-    kind,
-    title,
-    status: "running",
-    write: Boolean(write),
-    model,
-    summary: title,
-    logFile,
-    resultFile
-  });
-  writeJobFile(cwd, job);
-  fs.writeFileSync(logFile, "", "utf8");
-  fs.writeFileSync(progressFile, `${JSON.stringify({ phase: "queued", message: "queued", updatedAt: nowIso() }, null, 2)}\n`);
+  try {
+    upsertJob(cwd, {
+      id: jobId,
+      kind,
+      title,
+      status: "running",
+      write: Boolean(write),
+      model,
+      summary: title,
+      logFile,
+      resultFile
+    });
+    writeJobFile(cwd, job);
+    fs.writeFileSync(logFile, "", "utf8");
+    fs.writeFileSync(progressFile, `${JSON.stringify({ phase: "queued", message: "queued", updatedAt: nowIso() }, null, 2)}\n`);
+  } catch (error) {
+    cleanupPromptFile(promptFile);
+    throw error;
+  }
   return job;
 }
 
 function runOrBackground(cwd, job, grokOptions, { background, json, renderPayload }) {
+  const workerPolicy = normalizeWorkerPolicy(
+    { ...grokOptions, prompt: job.prompt, readOnly: grokOptions.write !== true },
+    { toolName: job.kind || "task", writeCapable: grokOptions.write === true }
+  );
+  grokOptions = {
+    ...grokOptions,
+    sandbox: workerPolicy.sandbox,
+    permissionMode: workerPolicy.permissionMode,
+    noSubagents: true,
+    disableWebSearch: true,
+    allow: workerPolicy.allow,
+    deny: workerPolicy.deny,
+    yolo: false,
+    env: buildWorkerEnv(process.env)
+  };
+  job.workerPolicy = summarizeWorkerPolicy(workerPolicy.workerPolicy);
+  job.config = { ...(job.config || {}), workerPolicy: job.workerPolicy };
+  writeJobFile(cwd, job);
   if (background) {
-    const spawned = spawnGrokBackground({
-      ...grokOptions,
-      resultFile: job.resultFile,
-      logFile: job.logFile,
-      progressFile: job.progressFile
-    });
+    let spawned;
+    try {
+      spawned = spawnGrokBackground({
+        ...grokOptions,
+        resultFile: job.resultFile,
+        logFile: job.logFile,
+        progressFile: job.progressFile
+      });
+    } catch (error) {
+      cleanupPromptFile(job.promptFile);
+      throw error;
+    }
     const pidFile = resolveJobPidFile(cwd, job.id);
     writePidFile(pidFile, spawned.pid);
     const runningJob = {
@@ -588,9 +811,15 @@ function runOrBackground(cwd, job, grokOptions, { background, json, renderPayloa
     return null;
   }
 
-  const grokResult = runGrok(grokOptions);
-  const finished = finalizeJob(cwd, job, grokResult, renderPayload?.finalizeExtras || {});
-  const payload = renderPayload?.build
+  let grokResult;
+  let finished;
+  try {
+    grokResult = runGrok(grokOptions);
+    finished = finalizeJob(cwd, job, grokResult, renderPayload?.finalizeExtras || {});
+  } finally {
+    cleanupPromptFile(job.promptFile);
+  }
+  const builtPayload = renderPayload?.build
     ? renderPayload.build(finished, grokResult)
     : {
         jobId: job.id,
@@ -603,10 +832,17 @@ function runOrBackground(cwd, job, grokOptions, { background, json, renderPayloa
         error: finished.error,
         review: finished.review,
         artifacts: finished.artifacts,
+        contract: finished.contract,
         bestOfN: job.bestOfN,
         worktree: job.worktree,
         check: job.check
       };
+  const payload = {
+    ...builtPayload,
+    snapshot: builtPayload.snapshot ?? finished.snapshot ?? null,
+    changes: builtPayload.changes ?? finished.changes ?? null,
+    rollback: builtPayload.rollback ?? finished.rollback ?? null
+  };
   outputResult(json ? payload : renderTaskResult(payload), Boolean(json));
   process.exitCode = finished.status === "completed" ? 0 : 1;
   return finished;
@@ -718,7 +954,7 @@ async function commandTask(argv) {
       "check",
       "json",
       "verbatim",
-      ...CONTROL_BOOLEAN_OPTIONS
+      ...CONTROL_BOOLEAN_OPTIONS, ...CONTRACT_BOOLEAN_OPTIONS
     ],
     valueOptions: [
       "model",
@@ -729,9 +965,9 @@ async function commandTask(argv) {
       "worktree-ref",
       "worktree-name",
       "resume-session",
-      ...CONTROL_VALUE_OPTIONS
+      ...CONTROL_VALUE_OPTIONS, ...CONTRACT_VALUE_OPTIONS
     ],
-    arrayOptions: [...CONTROL_ARRAY_OPTIONS],
+    arrayOptions: [...CONTROL_ARRAY_OPTIONS, ...CONTRACT_ARRAY_OPTIONS],
     aliasMap: {
       "read-only": "read-only",
       "resume-last": "resume-last",
@@ -749,8 +985,24 @@ async function commandTask(argv) {
     throw new Error("Missing task prompt. Example: task fix the failing tests");
   }
 
-  const control = controlFromParsedOptions(options);
+  const writeCapable = options["read-only"] !== true;
+  const workerPolicy = normalizeWorkerPolicy(
+    { ...options, prompt, readOnly: options["read-only"] === true, hostToolRequired: options["host-tool-required"] === true },
+    { toolName: "grok_rescue", writeCapable }
+  );
+
+  const control = controlFromParsedOptions({
+    ...options,
+    sandbox: workerPolicy.sandbox,
+    "permission-mode": workerPolicy.permissionMode,
+    "no-subagents": true,
+    "disable-web-search": true,
+    "host-tool-required": false,
+    deny: workerPolicy.deny
+  });
   const writeMode = !options["read-only"] && control.permissionMode !== "plan";
+  const completion = completionOptions(cwd, options, writeMode);
+  const { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure } = completion;
   const modelAlias = options.model;
   const model = normalizeModel(options.model);
   const effort = normalizeEffort(options.effort, modelAlias);
@@ -786,7 +1038,7 @@ async function commandTask(argv) {
   const job = createJobShell(cwd, {
     kind: "task",
     title: titleFromPrompt(prompt),
-    prompt,
+    prompt: appendCompletionContract(prompt, { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand }),
     write: writeMode,
     model,
     effort,
@@ -795,7 +1047,15 @@ async function commandTask(argv) {
       bestOfN,
       worktree: Boolean(worktree),
       check,
-      config: jobConfig
+      expectedFiles,
+      allowedChangedFiles, forbiddenChangedPaths,
+      checkCommand,
+      checkPolicy,
+      checkTimeoutMs,
+      snapshot,
+      rollbackOnFailure,
+       config: { ...jobConfig, workerPolicy: summarizeWorkerPolicy(workerPolicy.workerPolicy) },
+      workerPolicy: summarizeWorkerPolicy(workerPolicy.workerPolicy)
     }
   });
 
@@ -803,6 +1063,7 @@ async function commandTask(argv) {
     promptFile: job.promptFile,
     cwd,
     write: writeMode || control.permissionMode === "plan",
+    yolo: false,
     model,
     effort,
     resume,
@@ -811,7 +1072,8 @@ async function commandTask(argv) {
     check,
     worktree,
     worktreeRef: options["worktree-ref"],
-    verbatim: Boolean(options.verbatim)
+    verbatim: Boolean(options.verbatim),
+    env: buildWorkerEnv(process.env)
   };
   grokOptions = applyControlToGrokOptions(grokOptions, control);
 
@@ -830,10 +1092,12 @@ async function commandTask(argv) {
         error: finished.error,
         usage: finished.usage,
         artifacts: finished.artifacts,
+        contract: finished.contract,
         config: finished.config || jobConfig,
         bestOfN,
         worktree: Boolean(worktree),
-        check
+         check,
+         workerPolicy: summarizeWorkerPolicy(workerPolicy.workerPolicy)
       })
     }
   });
@@ -850,9 +1114,11 @@ async function commandPlan(argv) {
   }
 
   const control = controlFromParsedOptions({ ...options, plan: true });
+  const completion = completionOptions(cwd, options, true);
+  const { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure } = completion;
   const model = normalizeModel(options.model);
   const effort = normalizeEffort(options.effort, options.model);
-  const prompt = buildPlanModePrompt(userPrompt);
+  const prompt = appendCompletionContract(buildPlanModePrompt(userPrompt), { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand });
   const jobConfig = controlToJobConfig(control, {});
 
   const job = createJobShell(cwd, {
@@ -862,7 +1128,7 @@ async function commandPlan(argv) {
     write: false,
     model,
     effort,
-    extras: { config: jobConfig }
+    extras: { config: jobConfig, expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure }
   });
 
   let grokOptions = {
@@ -890,6 +1156,7 @@ async function commandPlan(argv) {
         error: finished.error,
         usage: finished.usage,
         artifacts: finished.artifacts,
+        contract: finished.contract,
         config: finished.config || jobConfig
       })
     }
@@ -908,10 +1175,10 @@ async function commandReview(argv, { adversarial = false } = {}) {
       "adversarial",
       "structured",
       "post-pending",
-      ...CONTROL_BOOLEAN_OPTIONS
+      ...CONTROL_BOOLEAN_OPTIONS, ...CONTRACT_BOOLEAN_OPTIONS
     ],
-    valueOptions: ["base", "scope", "model", "effort", "cwd", "pr", ...CONTROL_VALUE_OPTIONS],
-    arrayOptions: [...CONTROL_ARRAY_OPTIONS]
+    valueOptions: ["base", "scope", "model", "effort", "cwd", "pr", ...CONTROL_VALUE_OPTIONS, ...CONTRACT_VALUE_OPTIONS],
+    arrayOptions: [...CONTROL_ARRAY_OPTIONS, ...CONTRACT_ARRAY_OPTIONS]
   });
 
   const cwd = resolveWorkspaceRoot(options.cwd || process.cwd());
@@ -935,6 +1202,8 @@ async function commandReview(argv, { adversarial = false } = {}) {
   }
 
   const control = controlFromParsedOptions(options);
+  const completion = completionOptions(cwd, options, false);
+  const { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure } = completion;
   const prompt = buildStructuredReviewPrompt(target, focusText, { adversarial: isAdversarial });
   const model = normalizeModel(options.model);
   const effort = normalizeEffort(options.effort, options.model);
@@ -952,6 +1221,13 @@ async function commandReview(argv, { adversarial = false } = {}) {
     effort,
     extras: {
       config: jobConfig,
+      expectedFiles,
+      allowedChangedFiles, forbiddenChangedPaths,
+      checkCommand,
+      checkPolicy,
+      checkTimeoutMs,
+      snapshot,
+      rollbackOnFailure,
       wantPostPending: postPending,
       reviewTarget: {
         kind: target.kind,
@@ -1002,6 +1278,7 @@ async function commandReview(argv, { adversarial = false } = {}) {
         review: finished.review,
         usage: finished.usage,
         artifacts: finished.artifacts,
+        contract: finished.contract,
         postPending: finished.postPending || null,
         config: jobConfig
       })
@@ -1045,10 +1322,10 @@ async function commandWorkflow(argv) {
         "background",
         "json",
         "validate-only",
-        ...CONTROL_BOOLEAN_OPTIONS
+        ...CONTROL_BOOLEAN_OPTIONS, ...CONTRACT_BOOLEAN_OPTIONS
       ],
-      valueOptions: ["model", "effort", "cwd", "arg", ...CONTROL_VALUE_OPTIONS],
-      arrayOptions: ["arg", ...CONTROL_ARRAY_OPTIONS]
+      valueOptions: ["model", "effort", "cwd", "arg", ...CONTROL_VALUE_OPTIONS, ...CONTRACT_VALUE_OPTIONS],
+      arrayOptions: ["arg", ...CONTROL_ARRAY_OPTIONS, ...CONTRACT_ARRAY_OPTIONS]
     });
     const name = positionals[0];
     if (!name) {
@@ -1069,6 +1346,8 @@ async function commandWorkflow(argv) {
     const jobConfig = controlToJobConfig(control, { workflowName: name });
     // validate-only must not grant yolo write+shell — smoke-check only.
     const writeCapable = !validateOnly;
+    const completion = completionOptions(cwd, options, writeCapable);
+    const { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure } = completion;
 
     const job = createJobShell(cwd, {
       kind: "workflow",
@@ -1077,7 +1356,7 @@ async function commandWorkflow(argv) {
       write: writeCapable,
       model,
       effort,
-      extras: { config: jobConfig, workflowName: name, validateOnly }
+      extras: { config: jobConfig, workflowName: name, validateOnly, expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure }
     });
 
     let grokOptions = {
@@ -1104,6 +1383,7 @@ async function commandWorkflow(argv) {
           error: finished.error,
           usage: finished.usage,
           artifacts: finished.artifacts,
+        contract: finished.contract,
           config: jobConfig
         })
       }
@@ -1123,6 +1403,8 @@ async function commandDesign(argv) {
     throw new Error("Missing design brief. Example: design add multi-tenant billing");
   }
   const control = controlFromParsedOptions(options);
+  const completion = completionOptions(cwd, options, true);
+  const { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure } = completion;
   const model = normalizeModel(options.model || "deep");
   const effort = normalizeEffort(options.effort || "high", options.model || "deep");
   const prompt = buildDesignPrompt(brief);
@@ -1135,7 +1417,7 @@ async function commandDesign(argv) {
     write: true,
     model,
     effort,
-    extras: { config: jobConfig }
+    extras: { config: jobConfig, expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure }
   });
 
   let grokOptions = {
@@ -1162,6 +1444,7 @@ async function commandDesign(argv) {
         error: finished.error,
         usage: finished.usage,
         artifacts: finished.artifacts,
+        contract: finished.contract,
         config: jobConfig
       })
     }
@@ -1178,7 +1461,7 @@ async function commandExecutePlan(argv) {
       "auto-pr",
       "no-graphite",
       "latest",
-      ...CONTROL_BOOLEAN_OPTIONS
+      ...CONTROL_BOOLEAN_OPTIONS, ...CONTRACT_BOOLEAN_OPTIONS
     ],
     valueOptions: [
       "model",
@@ -1187,9 +1470,9 @@ async function commandExecutePlan(argv) {
       "concurrency",
       "instructions",
       "resume",
-      ...CONTROL_VALUE_OPTIONS
+      ...CONTROL_VALUE_OPTIONS, ...CONTRACT_VALUE_OPTIONS
     ],
-    arrayOptions: [...CONTROL_ARRAY_OPTIONS]
+    arrayOptions: [...CONTROL_ARRAY_OPTIONS, ...CONTRACT_ARRAY_OPTIONS]
   });
   const cwd = resolveWorkspaceRoot(options.cwd || process.cwd());
   const designDocPath = positionals[0] || null;
@@ -1228,6 +1511,8 @@ async function commandExecutePlan(argv) {
   const jobConfig = controlToJobConfig(control, {});
   // Dry-run must not get --yolo; report linearized order only.
   const writeCapable = !dryRun;
+  const completion = completionOptions(cwd, options, writeCapable);
+  const { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure } = completion;
 
   const job = createJobShell(cwd, {
     kind: "execute-plan",
@@ -1241,7 +1526,7 @@ async function commandExecutePlan(argv) {
     write: writeCapable,
     model,
     effort,
-    extras: { config: jobConfig, designDocPath: absDoc, resumePlanId, dryRun }
+    extras: { config: jobConfig, designDocPath: absDoc, resumePlanId, dryRun, expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure }
   });
 
   let grokOptions = {
@@ -1268,6 +1553,7 @@ async function commandExecutePlan(argv) {
         error: finished.error,
         usage: finished.usage,
         artifacts: finished.artifacts,
+        contract: finished.contract,
         config: jobConfig
       })
     }
@@ -1277,9 +1563,9 @@ async function commandExecutePlan(argv) {
 async function commandBabysit(argv) {
   const expanded = expandArgv(argv);
   const { options, positionals } = parseArgs(expanded, {
-    booleanOptions: ["background", "json", ...CONTROL_BOOLEAN_OPTIONS],
-    valueOptions: ["model", "effort", "cwd", ...CONTROL_VALUE_OPTIONS],
-    arrayOptions: [...CONTROL_ARRAY_OPTIONS]
+    booleanOptions: ["background", "json", ...CONTROL_BOOLEAN_OPTIONS, ...CONTRACT_BOOLEAN_OPTIONS],
+    valueOptions: ["model", "effort", "cwd", ...CONTROL_VALUE_OPTIONS, ...CONTRACT_VALUE_OPTIONS],
+    arrayOptions: [...CONTROL_ARRAY_OPTIONS, ...CONTRACT_ARRAY_OPTIONS]
   });
   const { action, prs } = parseBabysitInvocation(positionals);
   const cwd = resolveWorkspaceRoot(options.cwd || process.cwd());
@@ -1294,6 +1580,8 @@ async function commandBabysit(argv) {
       : babysitSupportsBackground(action);
   // list is read-only; add/remove/check may mutate watchlist or code.
   const writeCapable = action !== "list";
+  const completion = completionOptions(cwd, options, writeCapable);
+  const { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure } = completion;
 
   const job = createJobShell(cwd, {
     kind: "babysit",
@@ -1302,7 +1590,7 @@ async function commandBabysit(argv) {
     write: writeCapable,
     model,
     effort,
-    extras: { config: jobConfig, babysitAction: action, prs }
+    extras: { config: jobConfig, babysitAction: action, prs, expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure }
   });
 
   let grokOptions = {
@@ -1329,6 +1617,7 @@ async function commandBabysit(argv) {
         error: finished.error,
         usage: finished.usage,
         artifacts: finished.artifacts,
+        contract: finished.contract,
         config: jobConfig
       })
     }
@@ -1338,9 +1627,9 @@ async function commandBabysit(argv) {
 async function commandDocument(argv) {
   const expanded = expandArgv(argv);
   const { options, positionals } = parseArgs(expanded, {
-    booleanOptions: ["background", "json", ...CONTROL_BOOLEAN_OPTIONS],
-    valueOptions: ["type", "model", "effort", "cwd", "out", ...CONTROL_VALUE_OPTIONS],
-    arrayOptions: [...CONTROL_ARRAY_OPTIONS]
+    booleanOptions: ["background", "json", ...CONTROL_BOOLEAN_OPTIONS, ...CONTRACT_BOOLEAN_OPTIONS],
+    valueOptions: ["type", "model", "effort", "cwd", "out", ...CONTROL_VALUE_OPTIONS, ...CONTRACT_VALUE_OPTIONS],
+    arrayOptions: [...CONTROL_ARRAY_OPTIONS, ...CONTRACT_ARRAY_OPTIONS]
   });
   const cwd = resolveWorkspaceRoot(options.cwd || process.cwd());
   const docType = normalizeDocumentType(options.type || "docx");
@@ -1350,9 +1639,11 @@ async function commandDocument(argv) {
   }
   const outDir = options.out || path.join(cwd, ".grok-docs");
   const control = controlFromParsedOptions(options);
+  const completion = completionOptions(cwd, options, true);
+  const { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure } = completion;
   const model = normalizeModel(options.model);
   const effort = normalizeEffort(options.effort, options.model);
-  const prompt = buildDocumentPrompt({ type: docType, brief, outputDir: outDir });
+  const prompt = appendCompletionContract(buildDocumentPrompt({ type: docType, brief, outputDir: outDir }), { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand });
   const jobConfig = controlToJobConfig(control, { documentType: docType });
 
   const job = createJobShell(cwd, {
@@ -1362,7 +1653,7 @@ async function commandDocument(argv) {
     write: true,
     model,
     effort,
-    extras: { config: jobConfig, documentType: docType, mediaDir: outDir }
+    extras: { config: jobConfig, documentType: docType, mediaDir: outDir, expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure }
   });
 
   let grokOptions = {
@@ -1389,6 +1680,7 @@ async function commandDocument(argv) {
         error: finished.error,
         usage: finished.usage,
         artifacts: finished.artifacts,
+        contract: finished.contract,
         config: jobConfig
       })
     }
@@ -1647,16 +1939,22 @@ async function commandStopGateReview(argv) {
 
   const schema = fs.readFileSync(getReviewSchemaPath(), "utf8");
   // Safer stop-gate posture: denylist editors/shell, no yolo, optional sandbox read-only.
-  const grokResult = runGrok({
-    promptFile: job.promptFile,
-    cwd,
-    write: false,
-    yolo: false,
-    sandbox: "read-only",
-    noSubagents: true,
-    jsonSchema: schema
-  });
-  const finished = finalizeJob(cwd, job, grokResult, { parseReview: true });
+  let grokResult;
+  let finished;
+  try {
+    grokResult = runGrok({
+      promptFile: job.promptFile,
+      cwd,
+      write: false,
+      yolo: false,
+      sandbox: "read-only",
+      noSubagents: true,
+      jsonSchema: schema
+    });
+    finished = finalizeJob(cwd, job, grokResult, { parseReview: true });
+  } finally {
+    cleanupPromptFile(job.promptFile);
+  }
   const blocked = Boolean(finished.review && reviewHasBlockingFindings(finished.review));
   const payload = {
     enabled: true,

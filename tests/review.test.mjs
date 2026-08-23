@@ -4,9 +4,9 @@ import test from "node:test";
 import {
   reviewHasBlockingFindings,
   tryParseStructuredReview
-} from "../plugins/grok/scripts/lib/review.mjs";
-import { extractArtifactPaths } from "../plugins/grok/scripts/lib/media.mjs";
-import { buildGrokArgs } from "../plugins/grok/scripts/lib/grok.mjs";
+} from "../plugins/grok-codex-worker/scripts/lib/review.mjs";
+import { extractArtifactPaths } from "../plugins/grok-codex-worker/scripts/lib/media.mjs";
+import { buildGrokArgs } from "../plugins/grok-codex-worker/scripts/lib/grok.mjs";
 
 test("tryParseStructuredReview parses fenced JSON", () => {
   const review = tryParseStructuredReview(`Here you go:
@@ -50,17 +50,20 @@ test("buildGrokArgs supports best-of-n check worktree schema", () => {
   assert.ok(args.includes("--worktree"));
   assert.ok(args.includes("rescue-1"));
   assert.ok(args.includes("--json-schema"));
-  assert.ok(args.includes("--yolo"));
+  assert.ok(!args.includes("--yolo"));
+  assert.ok(args.includes("strict"));
+  assert.ok(args.includes("dontAsk"));
 });
 
-test("buildGrokArgs media mode uses denylist without yolo", () => {
+test("buildGrokArgs media mode uses permission denies without yolo", () => {
   const args = buildGrokArgs({
     prompt: "draw",
     media: true
   });
   assert.ok(!args.includes("--tools"));
   assert.ok(!args.includes("--yolo"));
-  assert.ok(args.includes("--disallowed-tools"));
+  assert.ok(!args.includes("--disallowed-tools"));
+  assert.ok(args.includes("Bash(*)"));
 });
 
 test("extractArtifactPaths finds backtick paths", () => {

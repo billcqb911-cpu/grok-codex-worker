@@ -4,6 +4,7 @@ import path from "node:path";
 import { resolveGrokBinary } from "./grok.mjs";
 import { runCommand } from "./process.mjs";
 import { encodeGrokSessionWorkspaceKey, resolveGrokSessionsRoot } from "./media.mjs";
+import { buildWorkerEnv } from "./security.mjs";
 
 /**
  * List sessions for cwd via `grok sessions list` with filesystem fallback.
@@ -13,7 +14,8 @@ export function listSessions({ cwd, limit = 20 } = {}) {
   if (binary) {
     const result = runCommand(binary, ["sessions", "list"], {
       cwd,
-      maxBuffer: 4 * 1024 * 1024
+      maxBuffer: 4 * 1024 * 1024,
+      env: buildWorkerEnv(process.env, { grokBinary: binary })
     });
     if (result.status === 0 && String(result.stdout || "").trim()) {
       const parsed = parseSessionsCliOutput(result.stdout);
@@ -34,7 +36,8 @@ export function searchSessions({ cwd, query, limit = 20 } = {}) {
   if (binary) {
     const result = runCommand(binary, ["sessions", "search", q], {
       cwd,
-      maxBuffer: 4 * 1024 * 1024
+      maxBuffer: 4 * 1024 * 1024,
+      env: buildWorkerEnv(process.env, { grokBinary: binary })
     });
     if (result.status === 0 && String(result.stdout || "").trim()) {
       const parsed = parseSessionsCliOutput(result.stdout);
@@ -73,7 +76,8 @@ export function exportSession(sessionId, { outputPath = null, cwd = process.cwd(
   }
   const result = runCommand(binary, args, {
     cwd,
-    maxBuffer: 20 * 1024 * 1024
+    maxBuffer: 20 * 1024 * 1024,
+    env: buildWorkerEnv(process.env, { grokBinary: binary })
   });
   if (result.status !== 0) {
     const err = String(result.stderr || result.stdout || "export failed").trim();

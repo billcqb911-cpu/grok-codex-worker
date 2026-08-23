@@ -12,7 +12,7 @@ Use with `grok_image` and `grok_video` (or companion `image` / `video` commands)
 
 - Images → `.grok-media/image/`
 - Videos → `.grok-media/video/`
-- Grok’s tools usually write under `~/.grok/sessions/…/images|videos/`. The companion **copies** finished assets into `.grok-media/` so the project path contract holds without needing shell/`write_file` (those stay denylisted).
+- Grok’s tools usually write under `~/.grok/sessions/…/images|videos/`. The companion **copies** finished assets into `.grok-media/`; Bash and source Edit/Write calls remain denied by the Phase 7 permission policy.
 - Video resolution is limited by Grok’s model tier (often **480p**); that is not a plugin bug.
 
 ## Image recipes
