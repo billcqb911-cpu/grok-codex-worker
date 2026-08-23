@@ -1,22 +1,22 @@
 {
-  "name": "grok-in-codex",
+  "name": "grok-codex-worker",
   "interface": {
-    "displayName": "Grok in Codex"
+    "displayName": "Grok Codex Worker"
   },
   "plugins": [
     {
-      "name": "grok",
+      "name": "grok-codex-worker",
       "source": {
         "source": "local",
-        "path": "./plugins/grok"
+        "path": "./plugins/grok-codex-worker"
       },
       "policy": {
         "installation": "AVAILABLE",
         "authentication": "ON_INSTALL"
       },
       "category": "Developer Tools",
-      "version": "0.5.8"
+      "version": "0.1.0"
     }
   ],
-  "version": "0.5.8"
+  "version": "0.1.0"
 }

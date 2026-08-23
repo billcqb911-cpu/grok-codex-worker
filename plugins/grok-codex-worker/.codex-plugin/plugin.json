@@ -1,0 +1,44 @@
+{
+  "name": "grok-codex-worker",
+  "version": "0.1.0+codex.20260823055456",
+  "description": "A reliable Grok worker for Codex with Windows discovery and artifact verification.",
+  "author": {
+    "name": "stdevMac",
+    "url": "https://github.com/stdevMac"
+  },
+  "homepage": "https://github.com/billcqb911-cpu/grok-codex-worker",
+  "repository": "https://github.com/billcqb911-cpu/grok-codex-worker",
+  "license": "Apache-2.0",
+  "keywords": [
+    "grok",
+    "xai",
+    "codex",
+    "mcp",
+    "code-review",
+    "delegation",
+    "image-generation",
+    "video-generation"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Grok Codex Worker",
+    "shortDescription": "Delegate reliable, verifiable work from Codex to Grok",
+    "longDescription": "Use the Grok CLI from Codex with Windows-aware discovery, explicit task status, artifact verification, background jobs, and structured results for plan, rescue, review, document, and media tasks.",
+    "developerName": "stdevMac",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/billcqb911-cpu/grok-codex-worker",
+    "defaultPrompt": [
+      "Ask Grok to review this branch",
+      "Use Grok to plan the auth rewrite",
+      "Verify that Grok wrote the requested plan file",
+      "Run a Grok task and inspect its evidence"
+    ],
+    "brandColor": "#111111"
+  }
+}

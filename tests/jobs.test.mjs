@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 import {
   AmbiguousJobError,
@@ -24,7 +26,7 @@ import {
   tryReadResultPayload,
   upsertJob,
   writeJobFile
-} from "../plugins/grok/scripts/lib/jobs.mjs";
+} from "../plugins/grok-codex-worker/scripts/lib/jobs.mjs";
 
 function withTempWorkspace(fn) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "grok-jobs-"));
@@ -53,6 +55,55 @@ function withTempWorkspace(fn) {
     fs.rmSync(root, { recursive: true, force: true });
   }
 }
+
+test("state updates from concurrent processes retain every job", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "grok-jobs-concurrent-"));
+  const pluginData = path.join(root, "grok-plugin-data");
+  const cwd = path.join(root, "repo");
+  fs.mkdirSync(cwd, { recursive: true });
+  fs.mkdirSync(pluginData, { recursive: true });
+  const moduleUrl = pathToFileURL(path.resolve("plugins/grok-codex-worker/scripts/lib/jobs.mjs")).href;
+  const workerSource = [
+    `import { upsertJob } from ${JSON.stringify(moduleUrl)};`,
+    "const prefix = process.env.GROK_TEST_WORKER;",
+    "for (let i = 0; i < 8; i += 1) {",
+    "  upsertJob(process.cwd(), { id: `${prefix}-${i}`, kind: 'task', status: 'completed', title: `${prefix}-${i}` });",
+    "}"
+  ].join("\n");
+  try {
+    const workers = Array.from({ length: 4 }, (_, worker) => new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, ["--input-type=module", "-e", workerSource], {
+          cwd,
+          env: {
+            ...process.env,
+            GROK_CODEX_PLUGIN_STATE: pluginData,
+            GROK_TEST_WORKER: `worker-${worker}`
+          },
+          stdio: ["ignore", "pipe", "pipe"]
+        });
+        let stderr = "";
+        child.stderr.on("data", (chunk) => { stderr += chunk; });
+        child.on("error", reject);
+        child.on("close", (code) => {
+          if (code !== 0) reject(new Error(`worker ${worker} exited ${code}: ${stderr}`));
+          else resolve(child);
+        });
+      }));
+    await Promise.all(workers);
+    const previous = process.env.GROK_CODEX_PLUGIN_STATE;
+    process.env.GROK_CODEX_PLUGIN_STATE = pluginData;
+    try {
+      const state = loadState(cwd);
+      assert.equal(state.jobs.length, 32);
+      assert.equal(new Set(state.jobs.map((job) => job.id)).size, 32);
+    } finally {
+      if (previous === undefined) delete process.env.GROK_CODEX_PLUGIN_STATE;
+      else process.env.GROK_CODEX_PLUGIN_STATE = previous;
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("isTrustedGrokPluginDataDir rejects other plugins like codex", () => {
   assert.equal(

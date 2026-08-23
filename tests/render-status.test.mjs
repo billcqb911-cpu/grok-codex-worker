@@ -8,7 +8,7 @@ import {
   renderStatusReport,
   renderStoredJobResult,
   renderTaskResult
-} from "../plugins/grok/scripts/lib/render.mjs";
+} from "../plugins/grok-codex-worker/scripts/lib/render.mjs";
 
 test("renderStatusReport single job shows usage postPending artifacts", () => {
   const text = renderStatusReport(
@@ -38,6 +38,36 @@ test("renderStatusReport single job shows usage postPending artifacts", () => {
   assert.match(text, /skipped/);
   assert.match(text, /Artifacts/);
   assert.match(text, /\.grok-designs\/x\.md/);
+});
+
+test("renderTaskResult shows completion contract evidence", () => {
+  const rendered = renderTaskResult({
+    jobId: "task-contract",
+    kind: "task",
+    status: "failed_artifact",
+    text: "Grok said done",
+    contract: {
+      verified: false,
+      missingFiles: ["out.md"],
+      expectedFiles: ["out.md"],
+      policy: { ok: true, policyVersion: 2 }
+    }
+  });
+  assert.match(rendered, /Completion contract/);
+  assert.match(rendered, /Missing files/);
+  assert.match(rendered, /Worker policy\*\*: passed \(v2\)/);
+});
+
+test("write result describes bounded mode and never advertises yolo", () => {
+  const rendered = renderTaskResult({
+    jobId: "task-bounded",
+    kind: "task",
+    status: "completed",
+    write: true,
+    text: "done"
+  });
+  assert.match(rendered, /bounded write/);
+  assert.doesNotMatch(rendered, /--yolo/);
 });
 
 test("renderTaskResult shows recoverable findings path on failed post", () => {

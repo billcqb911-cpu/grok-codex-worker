@@ -1,14 +1,20 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
 import test from "node:test";
 
 import {
   buildGrokArgs,
   buildGrokBackgroundWrapperSource,
   formatStreamProgressMessage,
+  getStreamLogSanitizerSource,
   getStreamProgressHelperSource,
   humanizeGrokFailure,
-  parseGrokJsonOutput
-} from "../plugins/grok/scripts/lib/grok.mjs";
+  parseGrokJsonOutput,
+  sanitizeStreamLogLine
+} from "../plugins/grok-codex-worker/scripts/lib/grok.mjs";
 
 test("parseGrokJsonOutput reads success payload", () => {
   const parsed = parseGrokJsonOutput(
@@ -30,23 +36,35 @@ test("parseGrokJsonOutput reads error payload", () => {
   assert.match(parsed.error, /nope/);
 });
 
-test("buildGrokArgs write mode uses yolo", () => {
+test("buildGrokArgs write mode enforces strict dontAsk without yolo", () => {
   const args = buildGrokArgs({ prompt: "hi", write: true, model: "grok-4.5" });
-  assert.ok(args.includes("--yolo"));
+  assert.ok(!args.includes("--yolo"));
+  assert.ok(args.includes("strict"));
+  assert.ok(args.includes("dontAsk"));
+  assert.ok(args.includes("Bash(*)"));
+  assert.ok(args.includes("MCPTool(*)"));
   assert.ok(args.includes("-m"));
   assert.ok(args.includes("grok-4.5"));
 });
 
-test("buildGrokArgs read-only mode uses denylist not allowlist", () => {
+test("buildGrokArgs rejects a direct low-level yolo bypass", () => {
+  assert.throws(
+    () => buildGrokArgs({ prompt: "hi", write: true, yolo: true }),
+    /yolo execution is not allowed/i
+  );
+});
+
+test("buildGrokArgs read-only mode keeps tool graph and uses permission denies", () => {
   const args = buildGrokArgs({ prompt: "review", write: false });
   assert.ok(!args.includes("--yolo"));
   assert.ok(!args.includes("--tools"));
-  assert.ok(args.includes("--disallowed-tools"));
-  assert.ok(args.some((a) => String(a).includes("run_terminal_cmd")));
+  assert.ok(!args.includes("--disallowed-tools"));
+  assert.ok(args.includes("Bash(*)"));
+  assert.ok(args.includes("Edit(*)"));
   assert.ok(args.includes("--rules"));
 });
 
-test("buildGrokArgs media mode avoids tools allowlist and yolo", () => {
+test("buildGrokArgs media mode avoids tool graph mutation and yolo", () => {
   const args = buildGrokArgs({
     prompt: "draw a banner",
     media: true,
@@ -55,8 +73,8 @@ test("buildGrokArgs media mode avoids tools allowlist and yolo", () => {
   });
   assert.ok(!args.includes("--tools"));
   assert.ok(!args.includes("--yolo"));
-  assert.ok(args.includes("--disallowed-tools"));
-  assert.ok(args.some((a) => String(a).includes("run_terminal_cmd")));
+  assert.ok(!args.includes("--disallowed-tools"));
+  assert.ok(args.includes("Bash(*)"));
 });
 
 test("humanizeGrokFailure maps RequirementError tool dumps", () => {
@@ -66,7 +84,7 @@ test("humanizeGrokFailure maps RequirementError tool dumps", () => {
     exitCode: 1
   });
   assert.match(msg, /tool configuration/i);
-  assert.match(msg, /disallowed-tools/i);
+  assert.match(msg, /permission deny rules/i);
   assert.ok(!/RequirementError \{/.test(msg));
 });
 
@@ -164,4 +182,148 @@ test("background wrapper embeds the same progress helper tests exercise", () => 
   assert.match(wrapper, /\|\|\s*"running"/g);
   const floors = wrapper.match(/\|\|\s*"running"/g) || [];
   assert.equal(floors.length, 2, "text and thought branches both floor empty progress");
+});
+
+test("tool stream logs retain only name, paths, and status", () => {
+  const context = new Map();
+  const started = sanitizeStreamLogLine(JSON.stringify({
+    type: "tool_call",
+    toolCallId: "call-1",
+    toolName: "read_file",
+    status: "started",
+    rawInput: {
+      target_file: "README.md",
+      content: "SECRET_FILE_BODY"
+    }
+  }), context);
+  assert.deepEqual(JSON.parse(started), {
+    toolName: "read_file",
+    filePaths: ["README.md"],
+    status: "started"
+  });
+
+  const completed = sanitizeStreamLogLine(JSON.stringify({
+    type: "tool_call_update",
+    toolCallId: "call-1",
+    status: "completed",
+    locations: [{ path: "README.md" }],
+    content: [{
+      type: "content",
+      content: { type: "text", text: "SECRET_FILE_BODY" }
+    }]
+  }), context);
+  assert.deepEqual(JSON.parse(completed), {
+    toolName: "read_file",
+    filePaths: ["README.md"],
+    status: "completed"
+  });
+  assert.ok(!started.includes("SECRET_FILE_BODY"));
+  assert.ok(!completed.includes("SECRET_FILE_BODY"));
+  assert.ok(!completed.includes("content"));
+});
+
+test("background wrapper embeds log sanitizer and never appends raw stdout chunks", () => {
+  const sanitizerSrc = getStreamLogSanitizerSource();
+  assert.equal(sanitizerSrc, sanitizeStreamLogLine.toString());
+
+  const wrapper = buildGrokBackgroundWrapperSource({
+    binary: "/usr/bin/true",
+    args: ["-p", "hi"],
+    resultFile: "/tmp/result.json",
+    logFile: "/tmp/job.log",
+    progressFile: "/tmp/progress.json",
+    cwd: "/tmp",
+    streaming: true
+  });
+  assert.ok(wrapper.includes(sanitizerSrc));
+  assert.ok(!wrapper.includes("append(text.trimEnd())"));
+  assert.match(wrapper, /sanitizeStreamLogLine\(line, toolLogContext\)/);
+});
+
+test("background worker persists redacted tool events without file bodies", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-redacted-log-"));
+  try {
+    const mock = path.join(dir, "mock-stream.mjs");
+    const logFile = path.join(dir, "job.log");
+    const resultFile = path.join(dir, "result.json");
+    const progressFile = path.join(dir, "progress.json");
+    fs.writeFileSync(mock, [
+      "const events = [",
+      "  { type: 'tool_call', toolCallId: 'call-1', toolName: 'read_file', status: 'started', rawInput: { target_file: 'README.md' } },",
+      "  { type: 'tool_call_update', toolCallId: 'call-1', status: 'completed', locations: [{ path: 'README.md' }], rawOutput: { type: 'FileContent', FileContent: { absolute_path: 'README.md', content: 'SECRET_FILE_BODY', raw_output: 'SECRET_FILE_BODY' } }, content: [{ type: 'content', content: { type: 'text', text: 'SECRET_FILE_BODY' } }] },",
+      "  { type: 'text', data: 'done' },",
+      "  { type: 'end', sessionId: 'session-1' }",
+      "];",
+      "for (const event of events) process.stdout.write(JSON.stringify(event) + '\\n');"
+    ].join("\n"));
+
+    const wrapper = buildGrokBackgroundWrapperSource({
+      binary: process.execPath,
+      args: [mock],
+      resultFile,
+      logFile,
+      progressFile,
+      cwd: dir,
+      streaming: true
+    });
+    const result = spawnSync(process.execPath, ["-e", wrapper], {
+      cwd: dir,
+      encoding: "utf8",
+      timeout: 10_000
+    });
+    assert.equal(result.status, 0, result.stderr);
+
+    const log = fs.readFileSync(logFile, "utf8");
+    assert.match(log, /"toolName":"read_file"/);
+    assert.match(log, /"filePaths":\["README\.md"\]/);
+    assert.match(log, /"status":"completed"/);
+    assert.ok(!log.includes("SECRET_FILE_BODY"));
+    assert.ok(!log.includes('"content"'));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("background worker redacts stderr diagnostics and removes its prompt file", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-stderr-log-"));
+  const promptDir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-companion-"));
+  const promptFile = path.join(promptDir, "prompt.md");
+  try {
+    const mock = path.join(dir, "mock-stderr.mjs");
+    const logFile = path.join(dir, "job.log");
+    const resultFile = path.join(dir, "result.json");
+    const progressFile = path.join(dir, "progress.json");
+    fs.writeFileSync(promptFile, "PRIVATE_PROMPT_BODY\n");
+    fs.writeFileSync(mock, [
+      "process.stderr.write('STDERR_SECRET_DIAGNOSTIC\\n');",
+      "process.stdout.write(JSON.stringify({ type: 'end', sessionId: 'session-stderr' }) + '\\n');"
+    ].join("\n"));
+    const wrapper = buildGrokBackgroundWrapperSource({
+      binary: process.execPath,
+      args: [mock],
+      promptFile,
+      resultFile,
+      logFile,
+      progressFile,
+      cwd: dir,
+      streaming: true
+    });
+    const result = spawnSync(process.execPath, ["-e", wrapper], {
+      cwd: dir,
+      encoding: "utf8",
+      timeout: 10_000
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const log = fs.readFileSync(logFile, "utf8");
+    assert.match(log, /stderr\] diagnostics emitted/);
+    assert.ok(!log.includes("STDERR_SECRET_DIAGNOSTIC"));
+    assert.ok(!log.includes("PRIVATE_PROMPT_BODY"));
+    assert.equal(fs.existsSync(promptFile), false);
+    assert.equal(fs.existsSync(promptDir), false);
+    const payload = JSON.parse(fs.readFileSync(resultFile, "utf8"));
+    assert.match(payload.stderr, /STDERR_SECRET_DIAGNOSTIC/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(promptDir, { recursive: true, force: true });
+  }
 });

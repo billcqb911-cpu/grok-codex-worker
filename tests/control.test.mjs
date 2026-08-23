@@ -9,9 +9,9 @@ import {
   controlToGrokFields,
   controlToJobConfig,
   normalizeControlOptions
-} from "../plugins/grok/scripts/lib/control.mjs";
-import { buildGrokArgs } from "../plugins/grok/scripts/lib/grok.mjs";
-import { parseArgs } from "../plugins/grok/scripts/lib/args.mjs";
+} from "../plugins/grok-codex-worker/scripts/lib/control.mjs";
+import { buildGrokArgs } from "../plugins/grok-codex-worker/scripts/lib/grok.mjs";
+import { parseArgs } from "../plugins/grok-codex-worker/scripts/lib/args.mjs";
 
 test("normalizeControlOptions maps sandbox aliases", () => {
   const c = normalizeControlOptions({ sandbox: "ro" });
@@ -45,12 +45,10 @@ test("controlFromParsedOptions handles --memory and --no-memory", () => {
 
 test("buildGrokArgs emits control surface flags", () => {
   const control = normalizeControlOptions({
-    sandbox: "workspace",
+    sandbox: "strict",
     planMode: true,
-    memory: true,
+    memory: false,
     noSubagents: true,
-    agent: "explore",
-    allow: ["Bash(npm*)"],
     deny: ["Bash(rm*)"],
     disableWebSearch: true,
     forkSession: true,
@@ -60,17 +58,15 @@ test("buildGrokArgs emits control surface flags", () => {
     applyControlToGrokOptions({ prompt: "hi", write: true }, control)
   );
   assert.ok(args.includes("--sandbox"));
-  assert.ok(args.includes("workspace"));
+  assert.ok(args.includes("strict"));
   assert.ok(args.includes("--permission-mode"));
   assert.ok(args.includes("plan"));
-  assert.ok(args.includes("--experimental-memory"));
+  assert.ok(args.includes("--no-memory"));
   assert.ok(args.includes("--no-subagents"));
-  assert.ok(args.includes("--agent"));
-  assert.ok(args.includes("explore"));
-  assert.ok(args.includes("--allow"));
-  assert.ok(args.includes("Bash(npm*)"));
   assert.ok(args.includes("--deny"));
   assert.ok(args.includes("Bash(rm*)"));
+  assert.ok(args.includes("Bash(*)"));
+  assert.ok(args.includes("MCPTool(*)"));
   assert.ok(args.includes("--disable-web-search"));
   assert.ok(args.includes("--fork-session"));
   assert.ok(args.includes("--max-turns"));

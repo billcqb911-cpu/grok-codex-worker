@@ -9,13 +9,14 @@ import { fileURLToPath } from "node:url";
 import {
   buildCompanionInvocation,
   listToolDefinitions,
+  resolveCompanionPath,
   resolveMcpCwd,
   runCompanion
-} from "../plugins/grok/mcp/server.mjs";
+} from "../plugins/grok-codex-worker/mcp/server.mjs";
 
 const SERVER_PATH = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
-  "../plugins/grok/mcp/server.mjs"
+  "../plugins/grok-codex-worker/mcp/server.mjs"
 );
 
 const EXPECTED_TOOLS = [
@@ -73,6 +74,14 @@ test("MCP companion calls run in the requested workspace", async () => {
   assert.equal(payload.workspaceRoot, fs.realpathSync(workspace));
 });
 
+test("MCP resolves the companion from the plugin root, not the active workspace", () => {
+  const companion = resolveCompanionPath();
+  assert.ok(path.isAbsolute(companion));
+  assert.equal(path.basename(companion), "grok-companion.mjs");
+  assert.ok(fs.existsSync(companion));
+  assert.notEqual(path.dirname(companion), fs.realpathSync(os.tmpdir()));
+});
+
 test("MCP rejects a missing workspace before spawning the companion", () => {
   const missing = path.join(os.tmpdir(), "grok-mcp-missing-workspace");
   assert.throws(() => resolveMcpCwd({ cwd: missing }), /Workspace directory does not exist/);
@@ -96,6 +105,23 @@ test("buildCompanionInvocation maps review arguments to the companion runtime", 
     "branch",
     "auth and race conditions"
   ]);
+});
+
+
+test("buildCompanionInvocation maps strict changed-file scope flags", () => {
+  const invocation = buildCompanionInvocation("grok_rescue", {
+    prompt: "only edit test",
+    allowedChangedFiles: ["tests/unit/test_narrative.py"],
+    forbiddenChangedPaths: ["src"],
+    snapshot: true,
+    rollbackOnFailure: true
+  });
+  assert.ok(invocation.args.includes("--allowed-changed-file"));
+  assert.ok(invocation.args.includes("tests/unit/test_narrative.py"));
+  assert.ok(invocation.args.includes("--forbidden-changed-path"));
+  assert.ok(invocation.args.includes("src"));
+  assert.ok(invocation.args.includes("--snapshot"));
+  assert.ok(invocation.args.includes("--rollback-on-failure"));
 });
 
 test("buildCompanionInvocation maps rescue aliases, control flags, and flags", () => {
@@ -264,8 +290,8 @@ test("stdio MCP transport speaks NDJSON (Codex framing)", async () => {
     const status = parsed.find((m) => m.id === 3);
     if (init && tools && status) {
       child.kill();
-      assert.equal(init.result?.serverInfo?.name, "grok-in-codex");
-      assert.equal(init.result?.serverInfo?.version, "0.5.8");
+      assert.equal(init.result?.serverInfo?.name, "grok-codex-worker");
+      assert.equal(init.result?.serverInfo?.version, "0.1.0");
       assert.ok(Array.isArray(tools.result?.tools));
       assert.equal(tools.result.tools.length, EXPECTED_TOOLS.length);
       assert.ok(tools.result.tools.some((t) => t.name === "grok_plan"));
