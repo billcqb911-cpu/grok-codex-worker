@@ -11,6 +11,7 @@ import {
   formatStreamProgressMessage,
   getStreamLogSanitizerSource,
   getStreamProgressHelperSource,
+  assertGrokCliCompatibility,
   humanizeGrokFailure,
   parseGrokJsonOutput,
   sanitizeStreamLogLine
@@ -75,6 +76,22 @@ test("buildGrokArgs media mode avoids tool graph mutation and yolo", () => {
   assert.ok(!args.includes("--yolo"));
   assert.ok(!args.includes("--disallowed-tools"));
   assert.ok(args.includes("Bash(*)"));
+});
+
+test("buildGrokArgs does not pass plugin orchestration flags to Grok CLI", () => {
+  const args = buildGrokArgs({
+    prompt: "review",
+    write: false,
+    check: true,
+    bestOfN: 3
+  });
+  assert.ok(!args.includes("--check"));
+  assert.ok(!args.includes("--best-of-n"));
+  assert.doesNotThrow(() => buildGrokArgs({ prompt: "review", check: true }));
+  assert.throws(
+    () => assertGrokCliCompatibility({ bestOfN: 3 }),
+    /does not support.*bestOfN/i
+  );
 });
 
 test("humanizeGrokFailure maps RequirementError tool dumps", () => {
@@ -172,16 +189,24 @@ test("background wrapper embeds the same progress helper tests exercise", () => 
     "worker script must contain the helper source (not a drifted copy)"
   );
   assert.ok(!wrapper.includes("formatProgressTail"), "old inline copy must be gone");
-  assert.match(wrapper, /formatStreamProgressMessage\(thoughtAcc/);
-  assert.match(wrapper, /formatStreamProgressMessage\(textAcc/);
+  assert.match(wrapper, /new HeadTailBuffer\(maxCaptureBytes\)/);
+  assert.match(wrapper, /formatStreamProgressMessage\(thoughtCapture\.toString/);
+  assert.match(wrapper, /formatStreamProgressMessage\(textCapture\.toString/);
+  assert.match(wrapper, /outputStats:/);
   // Call-site floor: empty helper result must not blank /status
   assert.match(
     wrapper,
-    /formatStreamProgressMessage\(textAcc,\s*\{\}\)\s*\|\|\s*"running"/
+    /formatStreamProgressMessage\(textCapture\.toString\([^)]*\),\s*\{\}\)\s*\|\|\s*"running"/
   );
   assert.match(wrapper, /\|\|\s*"running"/g);
   const floors = wrapper.match(/\|\|\s*"running"/g) || [];
   assert.equal(floors.length, 2, "text and thought branches both floor empty progress");
+});
+
+test("humanizeGrokFailure explains unsupported plugin orchestration flags", () => {
+  const msg = humanizeGrokFailure({ stderr: "error: unexpected argument '--check' found", exitCode: 2 });
+  assert.match(msg, /does not support.*orchestration flag/i);
+  assert.match(msg, /self-check/i);
 });
 
 test("tool stream logs retain only name, paths, and status", () => {
@@ -325,5 +350,48 @@ test("background worker redacts stderr diagnostics and removes its prompt file",
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
     fs.rmSync(promptDir, { recursive: true, force: true });
+  }
+});
+
+test("background worker bounds captured output and persistent logs with byte evidence", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "grok-bounded-output-"));
+  try {
+    const mock = path.join(dir, "mock-large.mjs");
+    const logFile = path.join(dir, "job.log");
+    const resultFile = path.join(dir, "result.json");
+    const progressFile = path.join(dir, "progress.json");
+    fs.writeFileSync(mock, [
+      'process.stdout.write(JSON.stringify({ type: "text", data: "x".repeat(100000) }) + "\\n");',
+      'process.stderr.write("e".repeat(100000));',
+      'process.stdout.write(JSON.stringify({ type: "end", sessionId: "session-large" }) + "\\n");'
+    ].join("\n"));
+    const wrapper = buildGrokBackgroundWrapperSource({
+      binary: process.execPath,
+      args: [mock],
+      resultFile,
+      logFile,
+      progressFile,
+      cwd: dir,
+      streaming: true,
+      maxCaptureBytes: 1024,
+      maxLogBytes: 2048
+    });
+    const result = spawnSync(process.execPath, ["-e", wrapper], {
+      cwd: dir,
+      encoding: "utf8",
+      timeout: 10_000
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const payload = JSON.parse(fs.readFileSync(resultFile, "utf8"));
+    assert.equal(payload.outputStats.stdout.truncated, true);
+    assert.equal(payload.outputStats.stderr.truncated, true);
+    assert.equal(payload.outputStats.text.truncated, true);
+    assert.ok(payload.outputStats.stdout.omittedBytes > 0);
+    assert.ok(Buffer.byteLength(payload.stderr, "utf8") < 1200);
+    assert.ok(fs.statSync(logFile).size <= 2048);
+    assert.match(fs.readFileSync(logFile, "utf8"), /bounded log output omitted/);
+    assert.doesNotThrow(() => JSON.parse(fs.readFileSync(progressFile, "utf8")));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
   }
 });

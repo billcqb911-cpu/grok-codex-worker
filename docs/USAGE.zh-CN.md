@@ -4,8 +4,9 @@
 作为主控模型，在合适的时候把受限的项目工作交给 Grok 4.6，并对实际文件变化、
 测试结果和权限策略进行验证。
 
-本文优先推荐统一入口 **Grok Auto**。普通用户不需要判断应该调用
-`grok_rescue`、`grok_plan` 还是 `grok_review`；直接描述目标即可。直接调用 MCP
+本文提供两个统一入口：**Grok Auto (Standard)** 和 **Grok Auto (Personal)**。
+普通用户不需要判断应该调用
+`grok_personal_read`、`grok_rescue`、`grok_plan` 还是 `grok_review`；直接描述目标即可。直接调用 MCP
 的方式保留给需要精确控制文件范围、测试命令或后台任务的高级场景。
 
 ## 目录
@@ -153,14 +154,15 @@ Codex App 输入框中的 `/` 用于打开技能菜单。技能负责告诉 Code
 
 | 技能 | 用途 |
 | --- | --- |
-| Grok Auto | 面向用户的统一入口，由 Codex 自动选择执行路径 |
+| Grok Auto (Standard) | 保持原有数据披露策略，由 Codex 自动选择执行路径 |
+| Grok Auto (Personal) | 个人项目模式：凭据脱敏后允许普通源码和数据外发，支持读写 |
 | Grok Brand Media | 图片和视频提示规范 |
 | Grok Routing | Codex 内部路由指导 |
 | Grok Prompting | Codex 内部任务提示整理 |
 | Grok CLI Runtime | Codex 内部 MCP/companion 调用契约 |
 | Grok Workflows | Codex 内部 workflow 使用指导 |
 
-普通开发和修复任务只需要使用 **Grok Auto**。其余内部技能不需要用户分类调用。
+普通开发和修复任务使用 **Grok Auto (Standard)**。个人项目如果允许将普通源码和数据发送到配置的远程 Grok 上游，选择 **Grok Auto (Personal)**。
 
 ## 5. Grok Auto 统一入口
 
@@ -169,7 +171,7 @@ Codex App 输入框中的 `/` 用于打开技能菜单。技能负责告诉 Code
 在目标项目的新 task 中：
 
 1. 在输入框输入 `/`；
-2. 选择 `Grok Codex Worker: Grok Auto`；
+2. 选择 `Grok Auto (Standard)`；个人源码外发场景选择 `Grok Auto (Personal)`；
 3. 在技能标签后输入 `on`，也可以同时附带项目任务；
 4. 发送消息。
 
@@ -192,7 +194,7 @@ $grok-auto on
 Codex 应简短确认：
 
 ```text
-Grok Auto: AUTO
+Grok Auto (Standard): AUTO
 ```
 
 随后，当前 task 中的请求由 Codex 自动判断是否需要 Grok。用户不需要自己选择具体
@@ -211,7 +213,7 @@ once
 Codex 应确认：
 
 ```text
-Grok Auto: ONCE
+Grok Auto (Standard): ONCE
 ```
 
 自动路由只应用于这一项实质任务，完成后回到 `OFF`。
@@ -227,14 +229,14 @@ status
 只返回当前 task 的状态：
 
 ```text
-Grok Auto: AUTO
+Grok Auto (Standard): AUTO
 ```
 
 或：
 
 ```text
-Grok Auto: ONCE
-Grok Auto: OFF
+Grok Auto (Standard): ONCE
+Grok Auto (Standard): OFF
 ```
 
 查询状态不会调用 Grok。
@@ -253,10 +255,59 @@ off
 $grok-auto off
 ```
 
+个人模式示例：
+
+```text
+$grok-auto-personal on
+```
+
+个人模式允许普通源码、算法、业务规则、客户数据、内部 URL 和数据库结构通过
+CC Switch 发送到配置的远程 Grok 上游，但会先创建临时副本并排除或替换 API key、
+私钥、密码、token、JWT、凭据文件和连接串密码。个人模式同时支持只读分析和写入任务；
+默认使用 `grok-4.6 + high`；
+写入只发生在临时副本，经过二次扫描、范围检查、测试和快照验证后才回写原工作区。
+它不会放宽 Grok 的 strict 沙箱、Bash/MCP/Web 禁止规则或宿主能力边界。
+
+Personal 模式的项目授权是任务级的：`on` 只作用于当前 Codex 工作区，不会长期授权
+其他项目。当前工作区只需输入 `once` 和需求，不需要重复发送授权句子：
+
+```text
+[$grok-codex-worker:grok-auto-personal]
+once
+需求：只读分析本项目是做什么的。
+```
+
+需要读取工作区外的项目时，才在同一条请求中使用 `once` 并明确指定项目根目录：
+
+```text
+[$grok-codex-worker:grok-auto-personal]
+once
+授权项目："E:\\APP\\MoneyPrinterTurbo\\MoneyPrinterTurbo"
+需求：只读分析这个项目的合成视频逻辑，不修改任何文件。
+```
+
+插件会要求 `authorizedProject` 与 `cwd` 完全匹配。任务完成后授权立即清除，不会被
+`on`、后续 task 或上下文压缩继承。`off` 和 `status` 不读取项目，也不会调用 Grok。
+这项授权只允许凭据脱敏后的数据外发，不能替代 Codex 对该路径的本地读取权限。
+
+Personal 的只读任务会调用专用的 `grok_personal_read`。该工具在 MCP 层静态声明为
+只读、非破坏性，同时如实声明会把脱敏暂存副本发送到配置的远程 Grok 上游，因此不会
+再把普通源码调查误送进 `grok_rescue` 的写入审批流程。每次 Personal MCP 调用都必须
+把 Codex `environment_context.cwd` 原样传为 `activeWorkspace`。当前工作区的 `cwd` 与
+`activeWorkspace` 相同且不得传 `authorizedProject`；外部项目保持原 `activeWorkspace`，
+并把外部路径同时传给 `cwd` 和 `authorizedProject`。需要修改源码时仍调用
+`grok_rescue`，并保留文件白名单、快照、测试和失败回滚。
+
+为了让大型项目可以稳定调用，临时副本默认不包含 `node_modules`、`.venv`、`dist`、
+`build`、`.next`、`coverage` 等依赖、构建和缓存目录，也不包含二进制文件或超过
+10 MiB 的单个文件；源码、算法、SQL、数据库结构、普通配置和文档仍会保留。
+模型可见的 MCP 参数也不会再提供必然被策略拒绝的 custom agent、memory 启用或
+caller allow 规则。
+
 Codex 应确认：
 
 ```text
-Grok Auto: OFF
+Grok Auto (Standard): OFF
 ```
 
 关闭后，当前 task 中的新请求由 Codex 模型自行处理，不再自动委派给 Grok。
@@ -273,7 +324,7 @@ Grok Auto: OFF
 不需要关闭整个 AUTO 模式，可以说：
 
 ```text
-本次请求不要调用 Grok，由 Codex 自己完成。后续保持 Grok Auto: AUTO。
+本次请求不要调用 Grok，由 Codex 自己完成。后续保持 Grok Auto (Standard): AUTO。
 ```
 
 本次任务结束后，后续请求仍可以自动路由。
@@ -390,6 +441,12 @@ Grok Auto 在写入任务中应自动使用以下保护：
 
 当多个任务同时运行时，每次查询都必须携带对应 `jobId`，不能依赖“最近一个任务”。
 
+同一个目标工作区可以并发运行只读、状态、结果和取消调用，但同一时间只允许一个写入任务。
+第二个写入任务会在 Grok 启动和快照创建前失败，避免两个任务的快照、校验或回滚互相覆盖。
+
+取消不是“发出 kill 就算完成”。插件会先记录 `cancel_requested`，终止该任务拥有的进程树，
+等待进程确认关闭，再执行变更检查和必要回滚，最后只发布一个终态结果。
+
 ## 10. 高级用法：直接调用 MCP
 
 一般用户可以跳过本节。需要精确控制时，明确要求“只调用 MCP 工具”。
@@ -406,18 +463,23 @@ cwd="E:\APP\MyProject"
 
 ### 10.2 只读分析
 
+Personal 脱敏源码分析：
+
 ```text
-请只调用 MCP 工具 grok_rescue：
+请只调用 MCP 工具 grok_personal_read：
 
 cwd="E:\APP\MyProject"
+activeWorkspace="E:\APP\MyProject"
 prompt="只读分析当前项目结构和主要风险。禁止创建、修改或删除任何文件。"
 model="grok-4.6"
-readOnly=true
-sandbox="read-only"
-fresh=true
-noSubagents=true
-disableWebSearch=true
+effort="high"
 ```
+
+`grok_personal_read` 会在服务端强制只读、Personal 脱敏、fresh、no-memory、无子代理和
+无网页搜索；这些安全字段不需要也不能由调用者重复传入。`activeWorkspace` 必须来自
+当前 Codex task 的 `environment_context.cwd`，不能使用插件安装缓存目录，也不能为了
+绕过外部项目检查而改成目标 `cwd`。Standard 模式的普通只读
+委托仍可使用 `grok_rescue + readOnly=true`。
 
 ### 10.3 严格限制单文件写入
 
@@ -564,6 +626,23 @@ SHA-256 快照、范围检查、测试和回滚。这里不宣称具有 Linux/ma
 不会在工具事件日志中保存实际文件正文。任务结果仍可能包含必要的 Grok 回答、错误
 诊断、用量和经过结构化处理的验证信息。
 
+每个任务还会在插件状态目录保存一个追加式生命周期日志 `${jobId}.events.ndjson`。
+它与 Grok 工具流日志不同，记录的是 harness 状态，例如：任务接受、策略确定、快照完成、
+进程启动/退出/输出关闭、取消请求、验证、回滚和最终完成或失败。多个进程同时写入时，
+`seq` 仍连续；敏感字段会被替换，单行最多 16 KiB。现有 schema-v3 job/status/result JSON
+继续作为兼容投影，不需要旧调用方改读取方式。
+
+任务结果中的证据分为：
+
+- `workerPolicy`：兼容旧版本的最终策略摘要；
+- `policyEvidence`：调用方请求、插件强制上限、实际生效策略和 SHA-256 指纹；
+- `invocation`：一次调用的 MCP request、job、工具和模型身份；
+- `executionEnvironment`：当前 Codex 工作区、目标工作区、真实执行工作区、根目录集合和环境 ID。
+
+Personal 模式的真实执行工作区是临时脱敏副本，因此它会与目标工作区不同；任务完成后该
+临时目录会被删除。以上证据不保存 prompt、文件正文、环境变量值或凭据，也不代表 Windows
+获得了额外的内核级沙箱。
+
 ## 14. 无人值守使用边界
 
 插件支持在一次已授权调用中自动完成：
@@ -595,7 +674,7 @@ SHA-256 快照、范围检查、测试和回滚。这里不宣称具有 Linux/ma
 1. 确认 `codex plugin list` 显示插件 `installed, enabled`；
 2. 重启 Codex App；
 3. 创建新 task；
-4. 输入 `/` 后重新查找 `Grok Codex Worker: Grok Auto`。
+4. 输入 `/` 后重新查找 `Grok Auto (Standard)` 或 `Grok Auto (Personal)`。
 
 旧 task 不会自动加载重装后的技能和 MCP 进程。
 
@@ -648,16 +727,24 @@ Test-Path (Join-Path $env:USERPROFILE '.grok\bin\grok.exe')
 
 ### 15.9 `grok_plan` 与“完全只读”冲突
 
-`grok_plan` 需要写入 `.grok-plans/`。完全零写入分析应改用：
+`grok_plan` 需要写入 `.grok-plans/`。Personal 的完全零写入分析应改用：
 
 ```text
-grok_rescue + readOnly=true
+grok_personal_read
 ```
+
+Standard 模式可继续使用 `grok_rescue + readOnly=true`。
 
 ### 15.10 `NO_COLOR` doctor 提示
 
 这通常只影响终端颜色，不影响 Grok 模型请求。判断能否工作应以固定响应模型请求和
 插件 `ready=true` 为准。
+
+### 15.11 提示不支持 custom agents/cross-session memory
+
+如果请求没有传 `agent` 或启用 memory，却仍在 Grok 启动前出现此错误，通常说明当前
+task 仍连接着修复前的 MCP 进程。重新安装最新版插件、完全退出并重启 Codex App，
+然后创建新 task；旧 task 不会切换到新的插件进程。
 
 ## 16. 更新开发版本
 
@@ -676,10 +763,16 @@ $codexCmd = Join-Path $env:APPDATA 'npm\codex.cmd'
 
 ```powershell
 npm.cmd test
+node --test tests/installed-cache.test.mjs
 python `
   C:\Users\windows\.codex\skills\.system\plugin-creator\scripts\validate_plugin.py `
   E:\APP\CodexProject\grok-codex-worker\plugins\grok-codex-worker
 ```
+
+`installed-cache.test.mjs` 会按源插件 manifest 的精确版本定位真实安装缓存，比较全部
+插件文件的 SHA-256，然后从缓存目录启动 MCP server，并用 mock Grok 验证当前项目、
+外部未授权拒绝和外部精确授权三条路径，同时核对 invocation、策略指纹、执行环境身份和
+连续事件日志。缓存尚未安装时该项会明确跳过；重装后必须通过。
 
 然后重启 Codex App 并创建新 task。
 
@@ -690,7 +783,7 @@ python `
 ```text
 1. 打开项目的新 task
 2. 输入 /
-3. 选择 Grok Codex Worker: Grok Auto
+3. 选择 `Grok Auto (Standard)`；需要个人源码脱敏外发时选择 `Grok Auto (Personal)`
 4. 输入 on 和实际任务
 5. Codex 自动决定是否调用 Grok
 6. 查看 Codex 对变更、测试和 verified 的最终审核

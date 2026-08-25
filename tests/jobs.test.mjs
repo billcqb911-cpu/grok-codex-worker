@@ -8,24 +8,32 @@ import { pathToFileURL } from "node:url";
 
 import {
   AmbiguousJobError,
+  WorkspaceBusyError,
+  acquireWorkspaceWriteLease,
   getLastTaskSessionId,
   hasResultFile,
   isTrustedGrokPluginDataDir,
   listRunningJobs,
   listTaskSessions,
   loadState,
+  readJobCancellation,
+  readJobProgress,
   recordTaskSession,
+  releaseWorkspaceWriteLease,
+  requestJobCancellation,
   refreshJobLiveness,
   resolveJob,
   resolveJobFile,
   resolvePluginStateRoot,
   resolveStateDir,
+  resolveWorkspaceWriteLeaseFile,
   saveState,
   shouldAttemptBackgroundFinalize,
   tailLog,
   tryReadResultPayload,
   upsertJob,
-  writeJobFile
+  writeJobFile,
+  writeJobProgress
 } from "../plugins/grok-codex-worker/scripts/lib/jobs.mjs";
 
 function withTempWorkspace(fn) {
@@ -154,6 +162,35 @@ test("tailLog truncates huge NDJSON status lines", () => {
   assert.match(lines[1], /truncated/);
   assert.equal(lines[2], "final");
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("workspace write lease serializes writers and releases by ownership token", () => {
+  withTempWorkspace((cwd) => {
+    const lease = acquireWorkspaceWriteLease(cwd, { jobId: "write-a" });
+    assert.equal(lease.jobId, "write-a");
+    assert.equal(fs.existsSync(resolveWorkspaceWriteLeaseFile(cwd)), true);
+    assert.throws(
+      () => acquireWorkspaceWriteLease(cwd, { jobId: "write-b" }),
+      (error) => error instanceof WorkspaceBusyError && error.lease?.jobId === "write-a"
+    );
+    assert.equal(releaseWorkspaceWriteLease(cwd, { ...lease, token: "wrong" }), false);
+    assert.equal(releaseWorkspaceWriteLease(cwd, lease), true);
+    const next = acquireWorkspaceWriteLease(cwd, { jobId: "write-b" });
+    assert.equal(next.jobId, "write-b");
+    assert.equal(releaseWorkspaceWriteLease(cwd, next), true);
+  });
+});
+
+test("job progress and cancellation projections are atomically readable", () => {
+  withTempWorkspace((cwd) => {
+    for (let index = 0; index < 50; index += 1) {
+      writeJobProgress(cwd, "atomic-job", { phase: "running", index });
+      assert.equal(readJobProgress(cwd, "atomic-job").index, index);
+    }
+    const marker = requestJobCancellation(cwd, "atomic-job", "test cancel");
+    assert.equal(marker.status, "cancel_requested");
+    assert.equal(readJobCancellation(cwd, "atomic-job").reason, "test cancel");
+  });
 });
 
 test("refreshJobLiveness does not reaper-fail when result.json exists", () => {

@@ -89,6 +89,38 @@ test("worker policy forces bounded profiles and cannot be widened by callers", (
   assert.throws(() => normalizeWorkerPolicy({ agent: "custom" }, { writeCapable: true }), /Custom agents/);
 });
 
+test("personal disclosure policy requires staging evidence without widening execution permissions", () => {
+  assert.throws(
+    () => normalizeWorkerPolicy({ dataPolicy: "personal-sanitized", sourceDisclosureConsent: false }, { writeCapable: false }),
+    /explicit sourceDisclosureConsent/
+  );
+  const policy = normalizeWorkerPolicy(
+    { dataPolicy: "personal-sanitized", sourceDisclosureConsent: true, sourceStaged: true, readOnly: true, personalMode: "on" },
+    { toolName: "grok_rescue", writeCapable: false }
+  );
+  assert.equal(policy.sandbox, "strict");
+  assert.equal(policy.permissionMode, "dontAsk");
+  assert.ok(policy.deny.includes("Bash(*)"));
+  assert.ok(policy.deny.includes("MCPTool(*)"));
+  assert.equal(policy.workerPolicy.dataDisclosure, "personal-sanitized");
+  assert.equal(policy.workerPolicy.sourceStaged, true);
+  assert.equal(evaluateWorkerPolicy(policy.workerPolicy).ok, true);
+  assert.equal(evaluateWorkerPolicy({ ...policy.workerPolicy, sourceStaged: false }).ok, false);
+  const shorthand = normalizeWorkerPolicy(
+    { dataPolicy: "personal-sanitized", sourceStaged: true, readOnly: true, personalMode: "once" },
+    { toolName: "grok_rescue", writeCapable: false }
+  );
+  assert.equal(shorthand.workerPolicy.disclosureConsent, "personal-mode-scope");
+  assert.equal(evaluateWorkerPolicy(shorthand.workerPolicy).ok, true);
+  assert.throws(
+    () => normalizeWorkerPolicy(
+      { dataPolicy: "personal-sanitized", sourceDisclosureConsent: true, forkSession: true },
+      { toolName: "grok_rescue", writeCapable: false }
+    ),
+    /must start fresh/
+  );
+});
+
 test("host-tool handoffs fail before a Grok child can start", () => {
   assert.throws(
     () => normalizeWorkerPolicy({ hostToolRequired: true }, { toolName: "grok_rescue", writeCapable: true }),

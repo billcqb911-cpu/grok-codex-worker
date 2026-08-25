@@ -96,11 +96,16 @@ test("parseArgs accumulates array options for allow/deny", () => {
 
 test("controlToJobConfig persists schema fields", () => {
   const control = normalizeControlOptions({ sandbox: "strict", planMode: true });
-  const config = controlToJobConfig(control, { bestOfN: 3, check: true });
+  const config = controlToJobConfig(control, {
+    bestOfN: 3,
+    check: true,
+    activeWorkspace: "C:\\Projects\\Current"
+  });
   assert.equal(config.sandbox, "strict");
   assert.equal(config.planMode, true);
   assert.equal(config.bestOfN, 3);
   assert.equal(config.check, true);
+  assert.equal(config.activeWorkspace, "C:\\Projects\\Current");
 });
 
 test("compareSemver works", () => {

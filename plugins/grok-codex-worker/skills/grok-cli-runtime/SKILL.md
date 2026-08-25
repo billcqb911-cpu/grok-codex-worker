@@ -39,6 +39,22 @@ MCP input keys map to companion flags:
 | `forkSession` | `--fork-session` |
 | `maxTurns` | `--max-turns` |
 
+Personal rescue scope keys:
+
+| MCP property | Companion flag | Scope |
+| --- | --- | --- |
+| `activeWorkspace` | `--active-workspace` | Current Codex `environment_context.cwd`; required for Personal MCP calls and never changed to an external target |
+| `personalMode` | `--personal-mode` | `on` for the active workspace, `once` for one external-project request |
+| `authorizedProject` | `--authorized-project` | Exact path; required for an external `once` request and must match `cwd` |
+
+`grok_personal_read` is the dedicated non-destructive Personal source-analysis
+tool. It always serializes a fresh, read-only, no-memory
+`personal-sanitized` task. Do not pass `authorizedProject` for the active
+workspace; pass it only for an external `cwd`, where it must match exactly.
+Always pass the unchanged current task `activeWorkspace` from
+`environment_context.cwd`; the installed plugin process directory is not a
+workspace identity.
+
 ## CLI posture
 
 - The runtime always reapplies the Phase 7 policy at the lowest launch layer.
@@ -63,14 +79,36 @@ MCP input keys map to companion flags:
 - Host plugin data: `CODEX_PLUGIN_DATA` only when the dir basename is trusted (`grok` / `grok-*`)
 - Does **not** share Claude plugin state (`GROK_CLAUDE_PLUGIN_STATE` / `claude-plugin`)
 
+## Personal read (`grok_personal_read`)
+
+- Statically advertised as read-only and non-destructive; it still declares
+  open-world access because sanitized source is sent to the configured remote
+  Grok upstream.
+- Forces `readOnly`, `personalMode=once`, disclosure consent, fresh session,
+  no memory/subagents/web search, and foreground execution.
+- Defaults to `grok-4.6 + high`; caller may request a different model/effort.
+- Uses `authorizedProject` only for one external project request.
+- Requires `activeWorkspace`; current reads have `cwd == activeWorkspace`,
+  while external reads preserve `activeWorkspace` and target another `cwd`.
+
 ## Task (`grok_rescue`)
 
 - Exactly one `task` invocation per handoff
-- Map `fast` → `--model grok-composer-2.5-fast`
-- Map `deep` → `--model grok-4.5 --effort high`
+- Default task routing → `--model grok-4.6 --effort high`
+- Map `fast` → `--model grok-4.6 --effort low`
+- Map `deep` → `--model grok-4.6 --effort high`
 - `resume` → `--resume-last`; `resumeSession` → resume that id; `fresh` → no resume
-- Pass `worktree`, `check`, `bestOfN` through when present
+- Pass `worktree` through when present. `check` is a companion-level self-check
+  contract and must not be serialized as a Grok CLI flag. The installed Grok
+  CLI does not support `bestOfN`/`--best-of-n`; reject values greater than one
+  before creating a job.
 - Default write-capable; `readOnly` only when requested
+- Personal disclosure defaults to the active workspace. `personalMode=once` or
+  `on` supplies the active workspace's one-task disclosure consent. Personal
+  MCP calls must pass `activeWorkspace` from the current Codex environment. An
+  external `cwd` is rejected unless `personalMode=once` and
+  `authorizedProject` exactly matches it; that authorization is task-local and
+  is not persisted or inherited.
 
 ## Plan (`grok_plan`)
 

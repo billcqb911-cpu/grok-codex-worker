@@ -112,9 +112,15 @@ export function evaluateActualChangeContract(cwd, job = {}, changeSet = null) {
     message
   };
 }
-export function appendCompletionContract(prompt, { expectedFiles = [], allowedChangedFiles = [], forbiddenChangedPaths = [], checkCommand = null } = {}) {
+export function appendCompletionContract(prompt, {
+  expectedFiles = [],
+  allowedChangedFiles = [],
+  forbiddenChangedPaths = [],
+  checkCommand = null,
+  selfCheck = false
+} = {}) {
   const files = Array.isArray(expectedFiles) ? expectedFiles : [];
-  if (!files.length && !allowedChangedFiles.length && !forbiddenChangedPaths.length && !checkCommand) return prompt;
+  if (!files.length && !allowedChangedFiles.length && !forbiddenChangedPaths.length && !checkCommand && !selfCheck) return prompt;
   const lines = [
     "",
     "Completion contract (the worker will verify this after you finish):",
@@ -122,6 +128,7 @@ export function appendCompletionContract(prompt, { expectedFiles = [], allowedCh
     ...(allowedChangedFiles.length ? [`- Only change these workspace files: ${allowedChangedFiles.join(", ")}`] : []),
     ...(forbiddenChangedPaths.length ? [`- Do not change these workspace paths: ${forbiddenChangedPaths.join(", ")}`] : []),
     ...(checkCommand ? [`- The worker will run this check command in the workspace: ${checkCommand}`] : []),
+    ...(selfCheck ? ["- Before your final response, inspect your own work and perform a concise self-check against the request and constraints."] : []),
     "- Do not claim completion unless the requested files really exist and contain the requested output."
   ];
   return `${prompt}${lines.join("\n")}`;

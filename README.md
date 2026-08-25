@@ -15,6 +15,7 @@ Using Claude Code instead? Use the sibling plugin: [grok-in-claude](https://gith
 | Codex MCP tool | Purpose |
 | --- | --- |
 | `grok_setup` | Check CLI + auth + version floor + doctor; toggle stop review gate |
+| `grok_personal_read` | Credential-redacted Personal source analysis (strictly read-only; remote Grok upstream) |
 | `grok_rescue` | Delegate investigation / fixes (write-capable; full control flags) |
 | `grok_plan` | Plan mode only (explore → plan.md under `.grok-plans/`) |
 | `grok_review` | Structured read-only review (tree / branch / PR; optional `postPending`) |
@@ -42,7 +43,9 @@ For a task that needs a Codex capability, use this handoff instead of asking Gro
 Codex calls the host plugin/MCP -> sanitize the minimum result -> grok_rescue for project work -> Codex verifies -> Codex performs the external action.
 ```
 
-The `grok_rescue` MCP approval authorizes only that one bounded worker invocation. It is not blanket approval for actions Grok might attempt inside its child process. Worker results include a redacted `workerPolicy` record with the effective sandbox, permission mode, network posture, host-tool boundary, and environment policy; it never includes prompt/file contents or credentials.
+The `grok_rescue` MCP approval authorizes only that one bounded worker invocation. It is not blanket approval for actions Grok might attempt inside its child process. Worker results retain the backward-compatible redacted `workerPolicy` record and also include `policyEvidence` (`requested`, plugin `authority`, `effective`, and a stable SHA-256 fingerprint), an `invocation` identity, and an `executionEnvironment` with explicit active/target/execution workspace roles. These records never include prompt/file contents, environment values, or credentials.
+
+The MCP server uses one startup-validated tool manifest as the source of truth for model-visible schemas, CLI serialization, read/write classification, parallel/background support, and approval class. Missing serializers, duplicate/reserved names, and incomplete capability/schema metadata fail before the server accepts work.
 
 On Windows, Grok 1.0.5 does not document a kernel-enforced sandbox implementation. The worker therefore reports `tool-policy-plus-snapshot` filesystem enforcement and `tool-policy-only` child-network enforcement on Windows; it does not claim Linux/macOS kernel guarantees. Write tasks remain protected by exact workspace Edit/Write rules, SHA-256 snapshots, scope validation, independent checks, and rollback, but this is not a VM boundary.
 
@@ -50,8 +53,13 @@ Skills: brand/media recipes, routing (including plan→design→execute-plan), r
 
 ### One-command automatic routing
 
-Select **Grok Codex Worker: Grok Auto** from the `/` skills menu, or explicitly
-invoke `$grok-auto`. The mode is limited to the current Codex task and never
+Select **Grok Auto (Standard)** from the `/` skills menu, or explicitly
+invoke `$grok-auto`. For personal source disclosure, select **Grok Auto
+(Personal)** and invoke `$grok-auto-personal`; `once` is the one-request consent
+for the active workspace and
+stages a credential-redacted project copy. Dependency/build/cache directories,
+binary files, and files larger than 10 MiB are omitted from that copy. Both modes are limited to the
+current Codex task and never
 writes project guidance:
 
 ```text
@@ -59,10 +67,47 @@ $grok-auto on       # AUTO for this task
 $grok-auto once     # automatic routing for one request, then OFF
 $grok-auto status   # show the current task-local mode
 $grok-auto off      # stop new Grok delegation in this task
+$grok-auto-personal on  # PERSONAL for the active workspace only
 ```
 
-In the Codex App UI, typing `/` opens the skills menu; select the Grok Auto
-entry and enter the mode or task after the inserted skill chip.
+For the active workspace, the short form is sufficient:
+
+```text
+$grok-auto-personal once
+需求：只读分析这个项目是做什么的。
+```
+
+Personal tasks default to `grok-4.6` with `high` effort. Use `fast` or an
+explicit lower effort only when a faster, cheaper run is intended.
+
+Personal read-only requests use the dedicated `grok_personal_read` MCP tool.
+Its static MCP contract is read-only and non-destructive, while accurately
+declaring that the sanitized staging copy goes to the configured remote Grok
+upstream. This prevents Codex from sending ordinary source analysis through
+the write-capable `grok_rescue` approval path. Personal implementation tasks
+still use `grok_rescue` with snapshots, an exact changed-file allowlist, checks,
+and rollback.
+
+Personal mode does not retain access to projects outside the active workspace.
+For an external project, use a task-local authorization and keep the project
+path separate from the request:
+
+```text
+$grok-auto-personal once
+授权项目："E:\\APP\\MoneyPrinterTurbo\\MoneyPrinterTurbo"
+需求：只读分析合成视频逻辑，不修改文件。
+```
+
+Every Personal MCP call receives `activeWorkspace=<Codex environment_context.cwd>`.
+For the active project, `cwd` is the same path and `authorizedProject` is omitted.
+For the external form above, `activeWorkspace` remains the Codex task workspace while
+`cwd` and `authorizedProject` both use the exact external path. Passing
+`authorizedProject` for the active workspace is rejected. `on` never authorizes an external path; `off` and `status`
+do not read projects or call Grok. The one-time authorization is cleared after
+the request and is not inherited by later tasks or context continuations.
+
+In the Codex App UI, typing `/` opens the skills menu; select the Standard or
+Personal entry and enter the mode or task after the inserted skill chip.
 
 In `AUTO`, Codex decides whether the request is small enough to handle directly
 or should use rescue, plan, design, review, or another Grok MCP tool. Codex still
@@ -70,6 +115,8 @@ owns verification and all host-only plugins, MCP, browser, credential, GitHub,
 and external actions. Turning the mode off does not cancel a background job that
 was already started; cancellation remains explicit. Every new Codex task starts
 `OFF` until the skill is invoked there.
+
+The public MCP schema omits custom-agent, memory-enablement, and caller-allow inputs because the worker can never honor them. Legacy or direct CLI attempts remain rejected by the runtime policy.
 
 ## Requirements
 
@@ -137,9 +184,11 @@ grok_video image="./.grok-media/image/hero.png" duration="6" prompt="gentle came
 
 ### Workspace selection
 
-Codex starts an installed plugin MCP server from the plugin cache, so pass the active project
-directory as `cwd` when calling a Grok tool from an installed plugin. The companion then runs in
-that directory and keeps jobs, git inspection, and artifacts scoped to the intended workspace.
+Codex starts an installed plugin MCP server from the plugin cache, so its process working directory
+does not identify the active project. Pass the target directory as `cwd`. Personal calls must also
+pass the unchanged Codex `environment_context.cwd` as `activeWorkspace`; this is how the worker
+distinguishes the current project from an external target. The companion then runs in `cwd` and
+keeps jobs, git inspection, and artifacts scoped to the intended workspace.
 
 For direct local calls, use for example:
 
@@ -159,11 +208,13 @@ For multi-PR or ambiguous product work, prefer:
 
 ## Job control semantics
 
-- **Concurrent multi-job support** — no single-job global lock. Prefer `background=true` for long work.
+- **Concurrent multi-job support** — read/status/result/cancel calls can run concurrently. Write-capable jobs are serialized per canonical target workspace so snapshots and rollback cannot overlap; a second writer fails before Grok starts.
 - **Status** — live progress is a tail of accumulated text *and* thought streams; empty/whitespace-only stream tokens floor to `running`.
 - **Result** — plan jobs prefer harvested `plan.md` body over narration; finished jobs persist `config`, `usage`, and `artifacts` (v3 schema).
+- **Cancellation** — MCP and `grok_cancel` first publish `cancel_requested`, terminate the owned process tree, wait for confirmed process close, then verify rollback and publish one terminal result.
 - **Reaper** — dead pid + complete parseable `result.json` reconciles to completed; dead pid + empty/truncated/incomplete result → terminal **failed** with distinct diagnostics (no forever-`running` zombies).
-- **Atomic writes** — background workers write `result.json` via tmp + rename (no partial mid-write; no leftover `.tmp.*` after success).
+- **Atomic and bounded persistence** — state, job, progress, cancellation, and background result projections use atomic replacement. Foreground/background output and persistent log tails are bounded and report retained/omitted byte counts.
+- **Lifecycle journal** — each job has an append-only `${jobId}.events.ndjson` beside its job files. Cross-process appends receive contiguous `seq` values and cover acceptance, policy, snapshot, process, cancellation, verification, rollback, and the single terminal outcome. Payloads redact sensitive keys and are bounded to 16 KiB per line.
 - **PR post-pending** — runs on background completion too; skips empty findings; empty/oversize diffs fail closed with recoverable findings under `.grok-reviews/`.
 
 ## Completion contract
@@ -202,6 +253,7 @@ Write-capable jobs create a snapshot before Grok starts. The snapshot is stored 
   - `checkPolicy` accepts `on-success` (default) or `always`.
   - Persistent state updates use a cross-process lock and atomic replacement; background prompt
     files are removed after the Grok process exits.
+- Job/state JSON remains the schema-v3 compatibility projection. The append-only event journal is additional audit/recovery evidence and does not change existing readers.
 - `checkTimeoutMs` limits a completion command to 100-3,600,000 ms (default 120,000).
 - Rollback is opt-in because a failed task may still contain useful partial work.
 
@@ -229,7 +281,10 @@ Default state root when unset: `~/.grok/codex-plugin/state/`. Codex does **not**
 
 - Write-capable by default.
 - Use `readOnly=true` for investigation-only work.
-- Use `worktree=true` / `check=true` / `bestOfN` for safer or parallel attempts.
+- Use `worktree=true` and `check=true` for safer attempts. `check=true` is a
+  plugin-level worker self-check; it is not passed as a `--check` Grok CLI
+  flag. The installed Grok CLI does not support `bestOfN`/`--best-of-n`; run
+  separate tasks when independent attempts are needed.
 - Use `expectedFiles`, `allowedChangedFiles`, `forbiddenChangedPaths`, and `checkCommand` for a verifiable write contract.
 - The caller may add deny rules but cannot add allow rules or enable custom agents, memory, subagents, shell, MCP, or web capabilities.
 

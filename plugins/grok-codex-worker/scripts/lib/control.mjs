@@ -21,7 +21,8 @@ export const CONTROL_BOOLEAN_OPTIONS = [
   "fork-session",
   "memory",
   "no-memory",
-  "host-tool-required"
+  "host-tool-required",
+  "source-disclosure-consent"
 ];
 
 /** Shared parseArgs value option names for control surface */
@@ -31,7 +32,8 @@ export const CONTROL_VALUE_OPTIONS = [
   "agent",
   "allow",
   "deny",
-  "max-turns"
+  "max-turns",
+  "data-policy"
 ];
 
 /** Keys that accept repeated flags (array values) */
@@ -177,7 +179,11 @@ export function controlToJobConfig(control, extras = {}) {
     postPending: Boolean(extras.postPending),
     documentType: extras.documentType ?? null,
     workflowName: extras.workflowName ?? null,
-    babysitAction: extras.babysitAction ?? null
+    babysitAction: extras.babysitAction ?? null,
+    dataPolicy: extras.dataPolicy ?? null,
+    personalMode: extras.personalMode ?? null,
+    authorizedProject: extras.authorizedProject ?? null,
+    activeWorkspace: extras.activeWorkspace ?? null
   };
 }
 

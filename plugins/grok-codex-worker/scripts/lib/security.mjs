@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { normalizeDataPolicy, validatePersonalProjectScope } from "./disclosure.mjs";
+import { fingerprintValue } from "./invocation.mjs";
 
 // Codex owns approvals, MCP, plugins, credentials, and external side effects.
 // Grok receives only a project-worker capability assembled in this module.
@@ -144,14 +146,6 @@ export function auditGrokConfiguration({ cwd = process.cwd(), home = os.homedir(
   };
 }
 
-export function isReadOnlyTool(toolName, input = {}) {
-  if (toolName === "grok_rescue") return input.readOnly === true;
-  return new Set([
-    "grok_setup", "grok_review", "grok_adversarial_review", "grok_status",
-    "grok_result", "grok_sessions", "grok_transfer"
-  ]).has(toolName);
-}
-
 export function assertNoHostToolRequest(input = {}) {
   if (input.hostToolRequired === true || input.requiresCodexTools === true) {
     throw new Error("Host-tool handoff required: Codex must invoke Codex plugins/MCP itself; Grok cannot be used as a host-tool proxy.");
@@ -161,11 +155,92 @@ export function assertNoHostToolRequest(input = {}) {
   }
 }
 
+function requestedPolicyEvidence(input, {
+  toolName,
+  readOnly,
+  requestedSandbox,
+  requestedMode,
+  requestedPolicyName,
+  personalScope,
+  sourceDisclosureConsent
+}) {
+  return {
+    schemaVersion: 1,
+    toolName,
+    readOnly,
+    sandbox: requestedSandbox,
+    permissionMode: requestedMode,
+    dataDisclosure: requestedPolicyName,
+    sourceDisclosureConsent,
+    personalMode: personalScope.mode,
+    externalProject: personalScope.externalProject,
+    authorizedProject: personalScope.authorizedProject,
+    activeWorkspace: personalScope.activeWorkspace,
+    planMode: input.planMode === true || input.plan === true,
+    noSubagents: input.noSubagents === true || input["no-subagents"] === true,
+    disableWebSearch: input.disableWebSearch === true || input["disable-web-search"] === true,
+    allow: Array.isArray(input.allow) ? [...new Set(input.allow.map(String))].sort() : [],
+    deny: Array.isArray(input.deny) ? [...new Set(input.deny.map(String))].sort() : []
+  };
+}
+
+export function createWorkerPolicyEvidence({ requested = {}, effective = {} } = {}) {
+  const authority = {
+    schemaVersion: 1,
+    principal: "grok-worker",
+    hostPrincipal: "codex",
+    sandbox: SAFE_SANDBOX,
+    permissionModes: [...SAFE_PERMISSION_MODES].sort(),
+    filesystemScope: "workspace",
+    hostTools: "codex-only",
+    shellTools: "denied",
+    mcpTools: "denied",
+    webSearch: "disabled",
+    webFetch: "disabled",
+    subagents: "disabled",
+    environment: "allowlist",
+    network: "model-transport-only-by-tool-policy"
+  };
+  const summarized = summarizeWorkerPolicy(effective);
+  return {
+    schemaVersion: 1,
+    requested,
+    authority,
+    effective: summarized,
+    fingerprint: fingerprintValue(summarized)
+  };
+}
+
 export function normalizeWorkerPolicy(input = {}, { toolName = "task", writeCapable = true } = {}) {
   if (input[POLICY_MARKER] === true) return input;
   assertNoHostToolRequest(input);
 
   const cwd = path.resolve(input.cwd || process.cwd());
+  const sourceDisclosureConsent = input.sourceDisclosureConsent === true || input["source-disclosure-consent"] === true;
+  const requestedDataPolicy = input.dataPolicy ?? input["data-policy"] ?? "strict";
+  const personalMode = input.personalMode ?? input["personal-mode"];
+  const authorizedProject = input.authorizedProject ?? input["authorized-project"];
+  const activeWorkspace = input.activeWorkspace || process.cwd();
+  const requestedPolicyName = String(requestedDataPolicy || "strict").trim().toLowerCase();
+  const requestedPersonalMode = String(personalMode || "").trim().toLowerCase();
+  const personalScope = validatePersonalProjectScope({
+    dataPolicy: requestedPolicyName,
+    personalMode,
+    authorizedProject,
+    cwd,
+    activeWorkspace
+  });
+  // Personal mode is an explicit user-selected disclosure route. For the
+  // active workspace, `once`/`on` itself authorizes this task-local sanitized
+  // staging. An external project still needs an exact authorizedProject path.
+  const scopedConsent = requestedPolicyName === "personal-sanitized" &&
+    (requestedPersonalMode === "once" || requestedPersonalMode === "on") &&
+    (personalScope.externalProject ? personalScope.authorizedProject != null : true);
+  const dataPolicy = normalizeDataPolicy(requestedDataPolicy, {
+    consent: sourceDisclosureConsent,
+    scopedConsent
+  });
+  const sourceStaged = input.sourceStaged === true;
   const configurationAudit = auditGrokConfiguration({ cwd });
   if (!configurationAudit.ok) {
     throw new Error(`${configurationAudit.message} Blocked paths: ${configurationAudit.violations.join(", ")}`);
@@ -191,6 +266,9 @@ export function normalizeWorkerPolicy(input = {}, { toolName = "task", writeCapa
   }
   if (input.agent || input.agentsJson || input.memory === true || input.memory?.enable === true) {
     throw new Error("Custom agents and cross-session memory cannot be delegated through the bounded Grok worker.");
+  }
+  if (dataPolicy === "personal-sanitized" && (input.forkSession === true || input["fork-session"] === true)) {
+    throw new Error("personal-sanitized tasks must start fresh and cannot fork a prior Grok session.");
   }
 
   const planMode = requestedMode === "plan";
@@ -231,8 +309,29 @@ export function normalizeWorkerPolicy(input = {}, { toolName = "task", writeCapa
     compatibilityDiscovery: "disabled",
     configurationPreflight: "passed",
     commandBoundary: "host-and-network-commands-denied",
+    dataDisclosure: dataPolicy,
+    disclosureConsent: dataPolicy === "personal-sanitized"
+      ? (sourceDisclosureConsent ? "explicit" : "personal-mode-scope")
+      : "not-required",
+    sourceStaged,
+    personalMode: personalScope.mode,
+    externalProject: personalScope.externalProject,
+    authorizedProject: personalScope.authorizedProject,
+    activeWorkspace: personalScope.activeWorkspace,
     ...evidence
   };
+  const policyEvidence = createWorkerPolicyEvidence({
+    requested: requestedPolicyEvidence(input, {
+      toolName,
+      readOnly,
+      requestedSandbox,
+      requestedMode,
+      requestedPolicyName,
+      personalScope,
+      sourceDisclosureConsent
+    }),
+    effective: workerPolicy
+  });
   const result = {
     ...input,
     cwd,
@@ -245,7 +344,8 @@ export function normalizeWorkerPolicy(input = {}, { toolName = "task", writeCapa
     allow: safeAllow,
     deny: [...new Set(deny)],
     yolo: false,
-    workerPolicy
+    workerPolicy,
+    policyEvidence
   };
   Object.defineProperty(result, POLICY_MARKER, { value: true, enumerable: true });
   return result;
@@ -264,6 +364,11 @@ export function evaluateWorkerPolicy(policy = null, { writeRequested = false } =
   if (policy?.compatibilityDiscovery !== "disabled") failures.push("foreign compatibility discovery not disabled");
   if (policy?.configurationPreflight !== "passed") failures.push("Grok configuration preflight not passed");
   if (policy?.hostTools !== "codex-only" || policy?.environment !== "allowlist") failures.push("host boundary not enforced");
+  if (!["strict", "personal-sanitized"].includes(policy?.dataDisclosure)) failures.push("invalid data disclosure policy");
+  const validPersonalDisclosureConsent = new Set(["explicit", "personal-mode-scope"]);
+  if (policy?.dataDisclosure === "personal-sanitized" && (!validPersonalDisclosureConsent.has(policy?.disclosureConsent) || policy?.sourceStaged !== true)) failures.push("personal disclosure staging or consent evidence missing");
+  if (policy?.dataDisclosure === "personal-sanitized" && policy?.externalProject && policy?.personalMode !== "once") failures.push("external personal disclosure is not task-local once");
+  if (policy?.dataDisclosure === "personal-sanitized" && policy?.externalProject && !policy?.authorizedProject) failures.push("external personal disclosure authorization is missing");
   return {
     ok: failures.length === 0,
     required: true,
@@ -357,6 +462,13 @@ export function summarizeWorkerPolicy(policy = {}) {
     compatibilityDiscovery: policy.compatibilityDiscovery ?? "disabled",
     configurationPreflight: policy.configurationPreflight ?? null,
     commandBoundary: "host-and-network-commands-denied",
+    dataDisclosure: policy.dataDisclosure ?? "strict",
+    disclosureConsent: policy.disclosureConsent ?? "not-required",
+    sourceStaged: policy.sourceStaged === true,
+    personalMode: policy.personalMode ?? null,
+    externalProject: policy.externalProject === true,
+    authorizedProject: policy.authorizedProject ?? null,
+    activeWorkspace: policy.activeWorkspace ?? null,
     filesystemEnforcement: policy.filesystemEnforcement ?? defaults.filesystemEnforcement,
     childNetworkEnforcement: policy.childNetworkEnforcement ?? defaults.childNetworkEnforcement
   };

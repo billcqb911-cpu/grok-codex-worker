@@ -54,6 +54,12 @@ test("completion prompt states the verification contract", () => {
   assert.match(prompt, /node --check index\.mjs/);
 });
 
+test("completion contract expresses self-check without a CLI flag", () => {
+  const prompt = appendCompletionContract("Review it", { selfCheck: true });
+  assert.match(prompt, /perform a concise self-check/i);
+  assert.doesNotMatch(prompt, /--check/);
+});
+
 test("check command uses a platform shell", () => {
   const spec = shellCommandForPlatform("echo ok");
   assert.ok(spec.command);

@@ -29,6 +29,7 @@ import {
 } from "./lib/control.mjs";
 import { buildDesignPrompt, buildExecutePlanPrompt, buildPlanModePrompt } from "./lib/design.mjs";
 import { createWorkspaceSnapshot, buildWorkspaceChangeSet, rollbackWorkspaceSnapshot } from "./lib/snapshot.mjs";
+import { applyDisclosureStage, cleanupDisclosureStage, createDisclosureStage, normalizeDataPolicy, redactText } from "./lib/disclosure.mjs";
 import { appendCompletionContract, describeContract, evaluateActualChangeContract, evaluateChangedFileScope, normalizeCheckPolicy, normalizeCheckTimeout, normalizeExpectedFiles, shellCommandForPlatform, validateSnapshotContract, verifyExpectedFiles, verifyProducedArtifacts } from "./lib/contracts.mjs";
 import { buildDocumentPrompt, normalizeDocumentType } from "./lib/documents.mjs";
 import { collectStopGateContext, resolveReviewTarget } from "./lib/git.mjs";
@@ -37,23 +38,33 @@ import {
   getGrokAvailability,
   humanizeGrokFailure,
   parseGrokJsonOutput,
-  runGrok,
+  assertGrokCliCompatibility,
+  runGrokAsync,
   runGrokDoctor,
   spawnGrokBackground
 } from "./lib/grok.mjs";
 import {
   AmbiguousJobError,
+  acquireWorkspaceWriteLease,
+  appendJobEvent,
   generateJobId,
   getConfig,
   getLastTaskSessionId,
+  isActiveJobStatus,
   listJobs,
   listRunningJobs,
   listTaskSessions,
   nowIso,
   readJobFile,
+  readJobCancellation,
+  readJobEvents,
   readJobProgress,
   recordTaskSession,
+  releaseWorkspaceWriteLease,
+  requestJobCancellation,
   resolveJob,
+  resolveJobCancelFile,
+  resolveJobEventsFile,
   resolveJobLogFile,
   resolveJobPidFile,
   resolveJobProgressFile,
@@ -62,9 +73,18 @@ import {
   shouldAttemptBackgroundFinalize,
   tailLog,
   tryReadResultPayload,
+  updateWorkspaceWriteLease,
   upsertJob,
-  writeJobFile
+  withJobFinalizationLock,
+  writeJobFile,
+  writeJobProgress,
+  writeJsonAtomic
 } from "./lib/jobs.mjs";
+import {
+  createInvocationEnvelope,
+  parseEvidenceEnvironment,
+  updateInvocationEnvelope
+} from "./lib/invocation.mjs";
 import {
   buildImagePrompt,
   buildVideoPrompt,
@@ -72,7 +92,7 @@ import {
   extractArtifactPaths,
   resolveMediaOutputDir
 } from "./lib/media.mjs";
-import { readPidFile, runCommand, terminateProcessTree, writePidFile } from "./lib/process.mjs";
+import { readPidFile, runCommand, terminateProcessTree, waitForProcessExit, writePidFile } from "./lib/process.mjs";
 import {
   renderBackgroundStarted,
   renderCancelReport,
@@ -97,23 +117,37 @@ import {
   discoverWorkflows,
   parseWorkflowArgs
 } from "./lib/workflow.mjs";
+
+const COMPANION_PATH = fileURLToPath(import.meta.url);
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
-import { normalizeWorkerPolicy, buildWorkerEnv, evaluateWorkerPolicy, summarizeWorkerPolicy } from "./lib/security.mjs";
+import {
+  buildWorkerEnv,
+  createWorkerPolicyEvidence,
+  evaluateWorkerPolicy,
+  normalizeWorkerPolicy,
+  summarizeWorkerPolicy
+} from "./lib/security.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
+const INHERITED_EVIDENCE = parseEvidenceEnvironment();
 const VALID_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
 const MODEL_ALIASES = new Map([
-  ["fast", "grok-composer-2.5-fast"],
-  ["default", "grok-4.5"],
-  ["deep", "grok-4.5"],
-  ["grok", "grok-4.5"]
+  ["fast", "grok-4.6"],
+  ["default", "grok-4.6"],
+  ["deep", "grok-4.6"],
+  ["grok", "grok-4.6"]
 ]);
 const PRESET_EFFORT = new Map([
-  ["deep", "high"]
+  ["fast", "low"],
+  ["deep", "high"],
+  ["default", "high"],
+  ["grok", "high"],
+  ["grok-4.6", "high"]
 ]);
 const CONTRACT_BOOLEAN_OPTIONS = ["snapshot", "no-snapshot", "rollback-on-failure"];
 const CONTRACT_ARRAY_OPTIONS = ["expected-file", "allowed-changed-file", "forbidden-changed-path"];
 const CONTRACT_VALUE_OPTIONS = ["check-command", "check-policy", "check-timeout-ms"];
+const PERSONAL_SCOPE_VALUE_OPTIONS = ["personal-mode", "authorized-project", "active-workspace"];
 
 
 function printUsage() {
@@ -126,6 +160,7 @@ function printUsage() {
       "       [--best-of-n <n>] [--sandbox <profile>] [--plan] [--permission-mode <mode>]",
       "       [--agent <name>] [--no-subagents] [--memory|--no-memory]",
       "       [--allow RULE]... [--deny RULE]... [--disable-web-search] [--fork-session]",
+      "       [--personal-mode on|once] [--active-workspace <path>] [--authorized-project <path>]",
       "       [--max-turns <n>] [prompt]",
       "  plan [--background] [--model <id>] [--effort <level>] [control flags...] [prompt]",
       "  task-resume-candidate [--json]",
@@ -227,6 +262,30 @@ function completionOptions(cwd, options, writeCapable) {
     rollbackOnFailure: Boolean(options["rollback-on-failure"])
   };
 }
+
+function promptCompletionContract(cwd, dataPolicy, {
+  expectedFiles = [],
+  allowedChangedFiles = [],
+  forbiddenChangedPaths = [],
+  checkCommand = null,
+  selfCheck = false
+} = {}) {
+  if (dataPolicy !== "personal-sanitized") {
+    return { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, selfCheck };
+  }
+
+  // Personal writes run in a mirrored staging root. Keep absolute paths for
+  // host-side verification, but expose only stage-relative paths to Grok so
+  // its Edit/Write calls cannot target the original workspace.
+  const relative = (value) => path.relative(cwd, value) || ".";
+  return {
+    expectedFiles: expectedFiles.map(relative),
+    allowedChangedFiles: allowedChangedFiles.map(relative),
+    forbiddenChangedPaths: forbiddenChangedPaths.map(relative),
+    checkCommand,
+    selfCheck
+  };
+}
 function titleFromPrompt(prompt, fallback = "Grok task") {
   const compact = String(prompt ?? "")
     .replace(/\s+/g, " ")
@@ -260,13 +319,69 @@ function cleanupPromptFile(promptFile) {
   } catch {}
 }
 
+function releaseJobWriteLease(cwd, job) {
+  return releaseWorkspaceWriteLease(cwd, job?.writeLease);
+}
+
+function watchJobCancellation(cwd, job) {
+  const controller = new AbortController();
+  let requested = null;
+  const check = () => {
+    if (requested || !job.cancelFile) return;
+    const marker = readJobCancellation(cwd, job.id) || (() => {
+      if (!fs.existsSync(job.cancelFile)) return null;
+      try { return JSON.parse(fs.readFileSync(job.cancelFile, "utf8")); }
+      catch { return { reason: "Cancelled by user", requestedAt: nowIso() }; }
+    })();
+    if (!marker) return;
+    requested = marker;
+    const cancelRequestedAt = marker.requestedAt || nowIso();
+    job.status = "cancel_requested";
+    job.cancelRequestedAt = cancelRequestedAt;
+    upsertJob(cwd, {
+      id: job.id,
+      status: "cancel_requested",
+      cancelRequestedAt,
+      summary: "Cancellation requested"
+    });
+    writeJobFile(cwd, job);
+    writeJobProgress(cwd, job.id, {
+      phase: "cancel_requested",
+      message: "Cancellation requested",
+      cancelRequestedAt
+    });
+    appendJobEvent(cwd, job.id, "cancel_requested", {
+      requestedAt: cancelRequestedAt,
+      reason: marker.reason || "Cancelled by user",
+      source: process.env.GROK_CANCEL_FILE ? "mcp" : "job"
+    }, { at: cancelRequestedAt });
+    controller.abort(marker.reason || "Cancelled by user");
+  };
+  check();
+  const timer = setInterval(check, 50);
+  timer.unref?.();
+  return {
+    signal: controller.signal,
+    get requested() { return requested; },
+    close() { clearInterval(timer); }
+  };
+}
+
 function enrichJob(cwd, job) {
   if (!job) {
     return job;
   }
   const progress = readJobProgress(cwd, job.id);
   const logTail = tailLog(job.logFile, 12);
-  return { ...job, progress, logTail };
+  const events = readJobEvents(cwd, job.id, { afterSeq: 0, limit: Number.MAX_SAFE_INTEGER });
+  return {
+    ...job,
+    progress,
+    logTail,
+    eventsFile: job.eventsFile || resolveJobEventsFile(cwd, job.id),
+    eventCursor: events.length ? events[events.length - 1].seq : 0,
+    lastEvent: events.length ? events[events.length - 1] : null
+  };
 }
 
 function resolveMediaArtifactsForJob(job, text, sessionId) {
@@ -355,10 +470,21 @@ function evaluateCompletionContract(cwd, job, artifacts, { grokOk = true } = {})
   return { status: "completed", failure: null, contract };
 }
 
-function applyWorkspaceOutcome(cwd, job, initialStatus, initialFailure = null) {
+function applyWorkspaceOutcome(
+  cwd,
+  job,
+  initialStatus,
+  initialFailure = null,
+  { forceRollback = false, skipActualChange = false } = {}
+) {
   const snapshotRequested = Boolean(job.snapshotRequested || (job.snapshot && typeof job.snapshot === "object"));
   if (!snapshotRequested) {
-    const actualChange = evaluateActualChangeContract(cwd, job, null);
+    const actualChange = skipActualChange
+      ? { ok: false, skipped: true, message: "Actual-change verification skipped because the job was cancelled." }
+      : evaluateActualChangeContract(cwd, job, null);
+    if (skipActualChange) {
+      return { status: initialStatus, snapshot: null, changes: null, actualChange, scope: null, rollback: null, failure: initialFailure };
+    }
     if (!actualChange.ok) {
       return { status: actualChange.status || "failed_snapshot", snapshot: null, changes: null, actualChange, scope: null, rollback: null, failure: actualChange.message };
     }
@@ -373,7 +499,9 @@ function applyWorkspaceOutcome(cwd, job, initialStatus, initialFailure = null) {
   } catch (error) {
     return { status: "failed_snapshot", snapshot: job.snapshot, changes: null, actualChange: { ok: false, status: "failed_snapshot", message: error instanceof Error ? error.message : String(error) }, scope: null, rollback: null, failure: "Unable to build workspace change set: " + (error instanceof Error ? error.message : String(error)) };
   }
-  const actualChange = evaluateActualChangeContract(cwd, job, changes);
+  const actualChange = skipActualChange
+    ? { ok: false, skipped: true, message: "Actual-change verification skipped because the job was cancelled." }
+    : evaluateActualChangeContract(cwd, job, changes);
   const scope = evaluateChangedFileScope(cwd, changes, { allowedChangedFiles: job.allowedChangedFiles || [], forbiddenChangedPaths: job.forbiddenChangedPaths || [] });
   if (!scope.ok) {
     if (initialStatus === "completed") {
@@ -387,7 +515,7 @@ function applyWorkspaceOutcome(cwd, job, initialStatus, initialFailure = null) {
       initialFailure = scope.message + " Required artifact verification also failed.";
     }
   }
-  if (!actualChange.ok) {
+  if (!actualChange.ok && !skipActualChange) {
     if (initialStatus === "completed") {
       initialStatus = actualChange.status || "failed_changes";
       initialFailure = actualChange.message;
@@ -396,9 +524,14 @@ function applyWorkspaceOutcome(cwd, job, initialStatus, initialFailure = null) {
       initialFailure = [initialFailure, actualChange.message].filter(Boolean).join(" ");
     }
   }
-  if (initialStatus === "completed" || !job.rollbackOnFailure) {
+  if (initialStatus === "completed" || (!job.rollbackOnFailure && !forceRollback)) {
     return { status: initialStatus, snapshot: job.snapshot, changes, actualChange, scope, rollback: null, failure: initialStatus !== "completed" ? initialFailure : null };
   }
+  appendJobEvent(cwd, job.id, "rollback_started", {
+    status: initialStatus,
+    forced: forceRollback,
+    changeCounts: changes.counts || null
+  });
   try {
     const rollback = rollbackWorkspaceSnapshot(cwd, job.snapshot, changes);
     const remainingChanges = buildWorkspaceChangeSet(cwd, job.snapshot);
@@ -409,32 +542,70 @@ function applyWorkspaceOutcome(cwd, job, initialStatus, initialFailure = null) {
     ) {
       rollback.ok = false;
       rollback.error = "Rollback verification found remaining workspace changes.";
+      appendJobEvent(cwd, job.id, "rollback_completed", { ok: false, error: rollback.error });
       return { status: "failed_rollback", snapshot: job.snapshot, changes, actualChange, scope, rollback, failure: (initialFailure || initialStatus) + "; " + rollback.error };
     }
     const rolledBackStatus = initialStatus + "_rolled_back";
+    appendJobEvent(cwd, job.id, "rollback_completed", { ok: true, remainingChanges: rollback.remainingChanges });
     return { status: rolledBackStatus, snapshot: job.snapshot, changes, actualChange, scope, rollback, failure: (initialFailure || initialStatus) + " after Grok work; workspace changes were rolled back." };
   } catch (error) {
-    return { status: "failed_rollback", snapshot: job.snapshot, changes, actualChange, scope, rollback: { ok: false, error: error instanceof Error ? error.message : String(error) }, failure: (initialFailure || initialStatus) + "; workspace rollback failed: " + (error instanceof Error ? error.message : String(error)) };
+    const rollbackError = error instanceof Error ? error.message : String(error);
+    appendJobEvent(cwd, job.id, "rollback_completed", { ok: false, error: rollbackError });
+    return { status: "failed_rollback", snapshot: job.snapshot, changes, actualChange, scope, rollback: { ok: false, error: rollbackError }, failure: (initialFailure || initialStatus) + "; workspace rollback failed: " + rollbackError };
   }
 }
+
+function applyDisclosureOutcome(cwd, job, write) {
+  if (!job?.disclosureStage) return { ok: true, applied: [], blocked: [], changed: [] };
+  if (job.disclosureOutcome) return job.disclosureOutcome;
+  const outcome = applyDisclosureStage(cwd, job.disclosureStage, { write, allowedChangedFiles: job.allowedChangedFiles || [] });
+  job.disclosureOutcome = outcome;
+  return outcome;
+}
+
+function sanitizeJobText(job, value) {
+  const text = String(value ?? "");
+  if (job?.dataPolicy !== "personal-sanitized") return text;
+  return redactText(text).text;
+}
+
+function sanitizeDisclosureValue(job, value) {
+  if (typeof value === "string") return sanitizeJobText(job, value);
+  if (Array.isArray(value)) return value.map((item) => sanitizeDisclosureValue(job, item));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, sanitizeDisclosureValue(job, item)]));
+  }
+  return value;
+}
+
 function finalizeJob(cwd, job, grokResult, extras = {}) {
   if (!job.workerPolicy && grokResult.workerPolicy) {
     job = { ...job, workerPolicy: summarizeWorkerPolicy(grokResult.workerPolicy) };
   }
   const parsed = grokResult.parsed;
   const ok = grokResult.ok;
-  const text = parsed?.text || (!ok ? parsed?.error || grokResult.stderr : "") || grokResult.stdout;
+  const cancelled = grokResult.cancelled === true;
+  const disclosureOutcome = applyDisclosureOutcome(cwd, job, Boolean(job.write));
+  const text = sanitizeJobText(job, parsed?.text || (!ok ? parsed?.error || grokResult.stderr : "") || grokResult.stdout);
   const sessionId = parsed?.sessionId ?? null;
-  let status = ok ? "completed" : "failed";
+  let status = cancelled ? "cancelled" : (ok ? "completed" : "failed");
   const finishedAt = nowIso();
   const review = extras.parseReview ? tryParseStructuredReview(text) : null;
   let artifacts =
     extras.artifacts ||
     harvestKindArtifacts(cwd, job, text, sessionId);
   artifacts = normalizeArtifactList(artifacts);
-  const contractResult = evaluateCompletionContract(cwd, job, artifacts, { grokOk: ok });
-  status = ok ? contractResult.status : "failed";
-  const workspaceOutcome = applyWorkspaceOutcome(cwd, job, status, contractResult.failure);
+  const contractResult = evaluateCompletionContract(cwd, job, artifacts, { grokOk: ok && disclosureOutcome.ok });
+  status = cancelled
+    ? "cancelled"
+    : (!disclosureOutcome.ok ? "failed_disclosure" : (ok ? contractResult.status : "failed"));
+  const workspaceOutcome = applyWorkspaceOutcome(
+    cwd,
+    job,
+    status,
+    cancelled ? (grokResult.cancellationReason || "Cancelled by user") : contractResult.failure,
+    { forceRollback: cancelled, skipActualChange: cancelled }
+  );
   status = workspaceOutcome.status;
 
   const usage =
@@ -446,7 +617,9 @@ function finalizeJob(cwd, job, grokResult, extras = {}) {
     ? `${review.verdict}: ${titleFromPrompt(review.summary, status)}`
     : titleFromPrompt(text, status);
 
-  const baseError = ok
+  const baseError = cancelled
+    ? grokResult.cancellationReason || "Cancelled by user"
+    : ok
     ? contractResult.failure
     : humanizeGrokFailure({
         parsedError: parsed?.error,
@@ -454,7 +627,7 @@ function finalizeJob(cwd, job, grokResult, extras = {}) {
         stdout: grokResult.stdout,
         exitCode: grokResult.status
       });
-  const error = workspaceOutcome.failure || baseError;
+  const error = disclosureOutcome.message || workspaceOutcome.failure || (baseError ? sanitizeJobText(job, baseError) : null);
 
   // Attach flags so post helper can see request even if only extras carried them.
   const jobForPost = {
@@ -498,17 +671,34 @@ function finalizeJob(cwd, job, grokResult, extras = {}) {
     grokSessionId: sessionId,
     exitCode: grokResult.status,
     error,
-    stderr: grokResult.stderr || null,
+    cancellation: cancelled ? {
+      requestedAt: job.cancelRequestedAt || null,
+      exitedAt: finishedAt,
+      closedAt: finishedAt,
+      reason: grokResult.cancellationReason || "Cancelled by user",
+      processClosed: true
+    } : null,
+    outputStats: grokResult.outputStats || null,
+    stderr: sanitizeJobText(job, grokResult.stderr || "") || null,
     contract: {
-      ...contractResult.contract,
+      ...sanitizeDisclosureValue(job, contractResult.contract),
       actualChange: workspaceOutcome.actualChange || null,
       scope: workspaceOutcome.scope,
-      verified: Boolean(contractResult.contract?.verified && (workspaceOutcome.actualChange?.ok ?? true) && (workspaceOutcome.scope?.ok ?? true))
+      verified: Boolean(!cancelled && contractResult.contract?.verified && (workspaceOutcome.actualChange?.ok ?? true) && (workspaceOutcome.scope?.ok ?? true))
     },
     snapshot: workspaceOutcome.snapshot,
     changes: workspaceOutcome.changes,
-    rollback: workspaceOutcome.rollback
+    rollback: workspaceOutcome.rollback,
+    disclosure: disclosureOutcome
   };
+
+  appendJobEvent(cwd, job.id, "verification_completed", {
+    ok: fullJob.contract?.verified === true,
+    status,
+    policyOk: fullJob.contract?.policy?.ok ?? null,
+    scopeOk: fullJob.contract?.scope?.ok ?? null,
+    actualChangeOk: fullJob.contract?.actualChange?.ok ?? null
+  });
 
   upsertJob(cwd, {
     id: job.id,
@@ -520,6 +710,13 @@ function finalizeJob(cwd, job, grokResult, extras = {}) {
     error: fullJob.error
   });
   writeJobFile(cwd, fullJob);
+  releaseJobWriteLease(cwd, fullJob);
+  appendJobEvent(cwd, job.id, status === "completed" ? "job_completed" : "job_failed", {
+    status,
+    exitCode: fullJob.exitCode,
+    verified: fullJob.contract?.verified === true,
+    processClosed: true
+  }, { at: finishedAt });
 
   if (
     sessionId &&
@@ -537,6 +734,14 @@ function finalizeJob(cwd, job, grokResult, extras = {}) {
 }
 
 function maybeFinalizeBackgroundJob(cwd, job) {
+  if (!job?.id) return enrichJob(cwd, job);
+  return withJobFinalizationLock(cwd, job.id, () => {
+    const latest = readJobFile(cwd, job.id) || job;
+    return maybeFinalizeBackgroundJobUnlocked(cwd, latest);
+  });
+}
+
+function maybeFinalizeBackgroundJobUnlocked(cwd, job) {
   // Reconcile when still running *or* reaper false-failed while result.json exists.
   if (!job || !shouldAttemptBackgroundFinalize(job)) {
     return enrichJob(cwd, job);
@@ -567,26 +772,49 @@ function maybeFinalizeBackgroundJob(cwd, job) {
         error: failed.error
       });
       writeJobFile(cwd, failed);
+      appendJobEvent(cwd, job.id, "job_failed", { status: failed.status, error: failed.error, processClosed: true }, { at: finishedAt });
+      cleanupDisclosureStage(job.disclosureStage);
+      releaseJobWriteLease(cwd, failed);
       return enrichJob(cwd, failed);
     }
     return enrichJob(cwd, job);
   }
   const payload = read.payload;
 
+  appendJobEvent(cwd, job.id, "process_exited", {
+    exitCode: payload.exitCode,
+    signal: payload.signal || null,
+    exitedAt: payload.lifecycle?.exitedAt || payload.finishedAt || null
+  }, { at: payload.lifecycle?.exitedAt || payload.finishedAt || nowIso() });
+  appendJobEvent(cwd, job.id, "output_closed", {
+    closedAt: payload.lifecycle?.closedAt || payload.finishedAt || null,
+    outputStats: payload.outputStats || null
+  }, { at: payload.lifecycle?.closedAt || payload.finishedAt || nowIso() });
+
   const parsed = parseGrokJsonOutput(payload.stdout || "");
   const ok = payload.exitCode === 0 && parsed.ok;
-  const text = parsed.text || parsed.error || payload.stdout || "";
+  const cancelled = payload.cancelled === true;
+  const disclosureOutcome = applyDisclosureOutcome(cwd, job, Boolean(job.write));
+  const text = sanitizeJobText(job, parsed.text || parsed.error || payload.stdout || "");
   const sessionId = parsed.sessionId ?? payload.sessionId ?? null;
-  let status = ok ? "completed" : "failed";
+  let status = cancelled ? "cancelled" : (ok ? "completed" : "failed");
   const finishedAt = payload.finishedAt || nowIso();
   const review =
     job.kind === "review" || job.kind === "adversarial-review" || job.kind === "stop-gate"
       ? tryParseStructuredReview(text)
       : null;
   const artifacts = normalizeArtifactList(harvestKindArtifacts(cwd, job, text, sessionId));
-  const contractResult = evaluateCompletionContract(cwd, job, artifacts, { grokOk: ok });
-  status = ok ? contractResult.status : "failed";
-  const workspaceOutcome = applyWorkspaceOutcome(cwd, job, status, contractResult.failure);
+  const contractResult = evaluateCompletionContract(cwd, job, artifacts, { grokOk: ok && disclosureOutcome.ok });
+  status = cancelled
+    ? "cancelled"
+    : (!disclosureOutcome.ok ? "failed_disclosure" : (ok ? contractResult.status : "failed"));
+  const workspaceOutcome = applyWorkspaceOutcome(
+    cwd,
+    job,
+    status,
+    cancelled ? (payload.cancellationReason || "Cancelled by user") : contractResult.failure,
+    { forceRollback: cancelled, skipActualChange: cancelled }
+  );
   status = workspaceOutcome.status;
   // Prefer plan.md body for plan jobs so /grok:result is useful after background.
   const resultText =
@@ -596,7 +824,9 @@ function maybeFinalizeBackgroundJob(cwd, job) {
     extractUsageFromStdout(payload.stdout) ||
     null;
 
-  const baseError = ok
+  const baseError = cancelled
+    ? payload.cancellationReason || "Cancelled by user"
+    : ok
     ? contractResult.failure
     : humanizeGrokFailure({
         parsedError: parsed.error,
@@ -604,7 +834,7 @@ function maybeFinalizeBackgroundJob(cwd, job) {
         stdout: payload.stdout,
         exitCode: payload.exitCode
       });
-  const error = workspaceOutcome.failure || baseError;
+  const error = disclosureOutcome.message || workspaceOutcome.failure || (baseError ? sanitizeJobText(job, baseError) : null);
 
   const jobForPost = {
     ...job,
@@ -647,18 +877,35 @@ function maybeFinalizeBackgroundJob(cwd, job) {
     grokSessionId: sessionId,
     exitCode: payload.exitCode,
     error,
-    stderr: payload.stderr || null,
+    cancellation: cancelled ? {
+      requestedAt: payload.lifecycle?.cancelRequestedAt || job.cancelRequestedAt || null,
+      exitedAt: payload.lifecycle?.exitedAt || finishedAt,
+      closedAt: payload.lifecycle?.closedAt || finishedAt,
+      reason: payload.cancellationReason || "Cancelled by user",
+      processClosed: true
+    } : null,
+    outputStats: payload.outputStats || null,
+    stderr: sanitizeJobText(job, payload.stderr || "") || null,
     contract: {
-      ...contractResult.contract,
+      ...sanitizeDisclosureValue(job, contractResult.contract),
       actualChange: workspaceOutcome.actualChange || null,
       scope: workspaceOutcome.scope,
-      verified: Boolean(contractResult.contract?.verified && (workspaceOutcome.actualChange?.ok ?? true) && (workspaceOutcome.scope?.ok ?? true))
+      verified: Boolean(!cancelled && contractResult.contract?.verified && (workspaceOutcome.actualChange?.ok ?? true) && (workspaceOutcome.scope?.ok ?? true))
     },
     snapshot: workspaceOutcome.snapshot,
     changes: workspaceOutcome.changes,
     rollback: workspaceOutcome.rollback,
+    disclosure: disclosureOutcome,
     pendingResult: false
   };
+
+  appendJobEvent(cwd, job.id, "verification_completed", {
+    ok: fullJob.contract?.verified === true,
+    status,
+    policyOk: fullJob.contract?.policy?.ok ?? null,
+    scopeOk: fullJob.contract?.scope?.ok ?? null,
+    actualChangeOk: fullJob.contract?.actualChange?.ok ?? null
+  });
 
   upsertJob(cwd, {
     id: job.id,
@@ -670,6 +917,14 @@ function maybeFinalizeBackgroundJob(cwd, job) {
     error: fullJob.error
   });
   writeJobFile(cwd, fullJob);
+  cleanupDisclosureStage(job.disclosureStage);
+  releaseJobWriteLease(cwd, fullJob);
+  appendJobEvent(cwd, job.id, status === "completed" ? "job_completed" : "job_failed", {
+    status,
+    exitCode: fullJob.exitCode,
+    verified: fullJob.contract?.verified === true,
+    processClosed: true
+  }, { at: finishedAt });
 
   if (
     sessionId &&
@@ -691,15 +946,65 @@ function createJobShell(cwd, { kind, title, prompt, write, model, effort, extras
   const logFile = resolveJobLogFile(cwd, jobId);
   const resultFile = path.join(path.dirname(logFile), `${jobId}.result.json`);
   const progressFile = resolveJobProgressFile(cwd, jobId);
-  const promptFile = writePromptFile(prompt);
+  const eventsFile = resolveJobEventsFile(cwd, jobId);
+  const cancelFile = process.env.GROK_CANCEL_FILE || resolveJobCancelFile(cwd, jobId);
   const snapshotRequested = Boolean(extras.snapshot);
+  const writeCapable = Boolean(write || snapshotRequested);
+  const inheritedInvocation = INHERITED_EVIDENCE.invocation;
+  const invocation = inheritedInvocation
+    ? updateInvocationEnvelope(inheritedInvocation, {
+      jobId,
+      tool: inheritedInvocation.tool || kind,
+      model,
+      effort,
+      activeWorkspace: extras.activeWorkspace || inheritedInvocation.activeWorkspace || cwd,
+      targetWorkspace: inheritedInvocation.targetWorkspace || cwd,
+      executionWorkspace: extras.executionWorkspace || cwd,
+      workspaceRoots: inheritedInvocation.workspaceRoots || [cwd]
+    })
+    : createInvocationEnvelope({
+      jobId,
+      tool: kind,
+      model,
+      effort,
+      activeWorkspace: extras.activeWorkspace || cwd,
+      targetWorkspace: cwd,
+      executionWorkspace: extras.executionWorkspace || cwd,
+      workspaceRoots: [extras.activeWorkspace, cwd].filter(Boolean),
+      policyFingerprint: extras.policyEvidence?.fingerprint || null
+    });
+  const inheritedPolicyEvidence = extras.policyEvidence || INHERITED_EVIDENCE.policyEvidence || null;
+  const writeLease = writeCapable
+    ? acquireWorkspaceWriteLease(cwd, { jobId, phase: "snapshot" })
+    : null;
+  let promptFile;
   let snapshot;
   try {
+    appendJobEvent(cwd, jobId, "accepted", {
+      kind,
+      write: Boolean(write),
+      invocationId: invocation.invocationId,
+      environmentId: invocation.environmentId
+    });
+    promptFile = writePromptFile(prompt);
     snapshot = snapshotRequested
       ? createWorkspaceSnapshot(cwd, { jobId, stateDir: resolveJobsDir(cwd) })
       : null;
+    if (snapshot) {
+      appendJobEvent(cwd, jobId, "snapshot_created", {
+        workspaceRoot: cwd,
+        fileCount: snapshot.fileCount ?? snapshot.files?.length ?? null
+      });
+    }
+    if (writeLease) updateWorkspaceWriteLease(cwd, writeLease, { phase: "ready" });
   } catch (error) {
+    appendJobEvent(cwd, jobId, "job_failed", {
+      status: "failed_preparation",
+      error: error instanceof Error ? error.message : String(error),
+      processClosed: true
+    });
     cleanupPromptFile(promptFile);
+    releaseWorkspaceWriteLease(cwd, writeLease);
     throw error;
   }
   const job = {
@@ -718,12 +1023,20 @@ function createJobShell(cwd, { kind, title, prompt, write, model, effort, extras
     logFile,
     resultFile,
     progressFile,
+    eventsFile,
+    cancelFile,
     promptFile,
     usage: null,
     artifacts: [],
     ...extras,
+    invocation,
+    policyEvidence: inheritedPolicyEvidence,
+    executionEnvironment: invocation.executionEnvironment,
+    environmentId: invocation.environmentId,
+    workspaceRoots: invocation.workspaceRoots,
     snapshotRequested,
-    snapshot
+    snapshot,
+    writeLease
   };
 
   try {
@@ -740,17 +1053,29 @@ function createJobShell(cwd, { kind, title, prompt, write, model, effort, extras
     });
     writeJobFile(cwd, job);
     fs.writeFileSync(logFile, "", "utf8");
-    fs.writeFileSync(progressFile, `${JSON.stringify({ phase: "queued", message: "queued", updatedAt: nowIso() }, null, 2)}\n`);
+    writeJobProgress(cwd, jobId, { phase: "queued", message: "queued" }, { replace: true });
   } catch (error) {
     cleanupPromptFile(promptFile);
+    releaseWorkspaceWriteLease(cwd, writeLease);
     throw error;
   }
   return job;
 }
 
-function runOrBackground(cwd, job, grokOptions, { background, json, renderPayload }) {
+async function runOrBackground(cwd, job, grokOptions, { background, json, renderPayload }) {
+  const stagedPersonal = job.dataPolicy === "personal-sanitized" && job.disclosureStage;
+  const policyInput = stagedPersonal
+    ? {
+      ...grokOptions,
+      // The staged root is an execution workspace, not a new disclosure
+      // target. Preserve the original project scope from job.workerPolicy.
+      personalMode: "on",
+      authorizedProject: null,
+      activeWorkspace: grokOptions.cwd
+    }
+    : grokOptions;
   const workerPolicy = normalizeWorkerPolicy(
-    { ...grokOptions, prompt: job.prompt, readOnly: grokOptions.write !== true },
+    { ...policyInput, prompt: job.prompt, readOnly: grokOptions.write !== true },
     { toolName: job.kind || "task", writeCapable: grokOptions.write === true }
   );
   grokOptions = {
@@ -764,9 +1089,58 @@ function runOrBackground(cwd, job, grokOptions, { background, json, renderPayloa
     yolo: false,
     env: buildWorkerEnv(process.env)
   };
-  job.workerPolicy = summarizeWorkerPolicy(workerPolicy.workerPolicy);
-  job.config = { ...(job.config || {}), workerPolicy: job.workerPolicy };
+  job.workerPolicy = summarizeWorkerPolicy({
+    ...workerPolicy.workerPolicy,
+    ...(stagedPersonal ? {
+      personalMode: job.workerPolicy?.personalMode ?? "once",
+      externalProject: job.workerPolicy?.externalProject === true,
+      authorizedProject: job.workerPolicy?.authorizedProject ?? null,
+      activeWorkspace: job.workerPolicy?.activeWorkspace ?? null,
+      sourceStaged: true,
+      dataDisclosure: job.dataPolicy,
+      disclosureConsent: "explicit"
+    } : {})
+  });
+  job.policyEvidence = createWorkerPolicyEvidence({
+    requested: job.policyEvidence?.requested || workerPolicy.policyEvidence.requested,
+    effective: job.workerPolicy
+  });
+  job.invocation = updateInvocationEnvelope(job.invocation, {
+    jobId: job.id,
+    tool: job.invocation?.tool || job.kind,
+    model: job.model,
+    effort: job.effort,
+    activeWorkspace: job.activeWorkspace || job.invocation?.activeWorkspace || cwd,
+    targetWorkspace: job.invocation?.targetWorkspace || cwd,
+    executionWorkspace: grokOptions.cwd,
+    workspaceRoots: job.invocation?.workspaceRoots || [cwd],
+    policyFingerprint: job.policyEvidence.fingerprint
+  });
+  job.executionEnvironment = job.invocation.executionEnvironment;
+  job.environmentId = job.invocation.environmentId;
+  job.workspaceRoots = job.invocation.workspaceRoots;
+  if (stagedPersonal) {
+    // Low-level Grok calls reapply policy. Keep them scoped to the isolated
+    // staging root while the job evidence retains the original authorization.
+    grokOptions.personalMode = "on";
+    grokOptions.authorizedProject = null;
+    grokOptions.activeWorkspace = grokOptions.cwd;
+  }
+  job.config = {
+    ...(job.config || {}),
+    workerPolicy: job.workerPolicy,
+    policyEvidence: job.policyEvidence,
+    invocation: job.invocation
+  };
   writeJobFile(cwd, job);
+  appendJobEvent(cwd, job.id, "policy_resolved", {
+    fingerprint: job.policyEvidence.fingerprint,
+    requested: job.policyEvidence.requested,
+    authority: job.policyEvidence.authority,
+    effective: job.policyEvidence.effective,
+    invocationId: job.invocation.invocationId,
+    environmentId: job.environmentId
+  });
   if (background) {
     let spawned;
     try {
@@ -774,14 +1148,30 @@ function runOrBackground(cwd, job, grokOptions, { background, json, renderPayloa
         ...grokOptions,
         resultFile: job.resultFile,
         logFile: job.logFile,
-        progressFile: job.progressFile
+        progressFile: job.progressFile,
+        cancelFile: job.cancelFile,
+        companionPath: COMPANION_PATH,
+        jobId: job.id
       });
     } catch (error) {
+      appendJobEvent(cwd, job.id, "job_failed", {
+        status: "failed_spawn",
+        error: error instanceof Error ? error.message : String(error),
+        processClosed: true
+      });
       cleanupPromptFile(job.promptFile);
+      cleanupDisclosureStage(job.disclosureStage);
+      releaseJobWriteLease(cwd, job);
       throw error;
     }
     const pidFile = resolveJobPidFile(cwd, job.id);
     writePidFile(pidFile, spawned.pid);
+    if (job.writeLease) {
+      updateWorkspaceWriteLease(cwd, job.writeLease, {
+        childPid: spawned.pid,
+        phase: "running-background"
+      });
+    }
     const runningJob = {
       ...job,
       pid: spawned.pid,
@@ -789,6 +1179,11 @@ function runOrBackground(cwd, job, grokOptions, { background, json, renderPayloa
       binary: spawned.binary,
       args: spawned.args
     };
+    appendJobEvent(cwd, job.id, "process_started", {
+      pid: spawned.pid,
+      background: true,
+      backend: job.invocation.backend
+    });
     upsertJob(cwd, { id: job.id, pid: spawned.pid, status: "running" });
     writeJobFile(cwd, runningJob);
     const otherRunning = listRunningJobs(cwd)
@@ -813,11 +1208,38 @@ function runOrBackground(cwd, job, grokOptions, { background, json, renderPayloa
 
   let grokResult;
   let finished;
+  const cancellation = watchJobCancellation(cwd, job);
   try {
-    grokResult = runGrok(grokOptions);
+    if (job.writeLease) {
+      updateWorkspaceWriteLease(cwd, job.writeLease, { phase: "running-foreground" });
+    }
+    appendJobEvent(cwd, job.id, "process_started", {
+      pid: null,
+      background: false,
+      backend: job.invocation.backend
+    });
+    grokResult = await runGrokAsync({ ...grokOptions, signal: cancellation.signal });
+    appendJobEvent(cwd, job.id, "process_exited", {
+      exitCode: grokResult.status,
+      signal: grokResult.signal || null,
+      cancelled: grokResult.cancelled === true
+    });
+    appendJobEvent(cwd, job.id, "output_closed", {
+      processClosed: true,
+      outputStats: grokResult.outputStats || null
+    });
+    writeJobProgress(cwd, job.id, {
+      phase: "closed",
+      message: grokResult.cancelled ? "cancelled and closed" : "worker process closed",
+      exitedAt: nowIso(),
+      closedAt: nowIso()
+    });
     finished = finalizeJob(cwd, job, grokResult, renderPayload?.finalizeExtras || {});
   } finally {
+    cancellation.close();
     cleanupPromptFile(job.promptFile);
+    cleanupDisclosureStage(job.disclosureStage);
+    releaseJobWriteLease(cwd, job);
   }
   const builtPayload = renderPayload?.build
     ? renderPayload.build(finished, grokResult)
@@ -841,7 +1263,12 @@ function runOrBackground(cwd, job, grokOptions, { background, json, renderPayloa
     ...builtPayload,
     snapshot: builtPayload.snapshot ?? finished.snapshot ?? null,
     changes: builtPayload.changes ?? finished.changes ?? null,
-    rollback: builtPayload.rollback ?? finished.rollback ?? null
+    rollback: builtPayload.rollback ?? finished.rollback ?? null,
+    cancellation: builtPayload.cancellation ?? finished.cancellation ?? null,
+    outputStats: builtPayload.outputStats ?? finished.outputStats ?? null,
+    invocation: builtPayload.invocation ?? finished.invocation ?? null,
+    policyEvidence: builtPayload.policyEvidence ?? finished.policyEvidence ?? null,
+    executionEnvironment: builtPayload.executionEnvironment ?? finished.executionEnvironment ?? null
   };
   outputResult(json ? payload : renderTaskResult(payload), Boolean(json));
   process.exitCode = finished.status === "completed" ? 0 : 1;
@@ -965,7 +1392,8 @@ async function commandTask(argv) {
       "worktree-ref",
       "worktree-name",
       "resume-session",
-      ...CONTROL_VALUE_OPTIONS, ...CONTRACT_VALUE_OPTIONS
+      ...CONTROL_VALUE_OPTIONS, ...CONTRACT_VALUE_OPTIONS,
+      ...PERSONAL_SCOPE_VALUE_OPTIONS
     ],
     arrayOptions: [...CONTROL_ARRAY_OPTIONS, ...CONTRACT_ARRAY_OPTIONS],
     aliasMap: {
@@ -975,7 +1403,10 @@ async function commandTask(argv) {
       "max-turns": "max-turns",
       "best-of-n": "best-of-n",
       "worktree-ref": "worktree-ref",
-      "worktree-name": "worktree-name"
+      "worktree-name": "worktree-name",
+      "personal-mode": "personal-mode",
+      "authorized-project": "authorized-project",
+      "active-workspace": "active-workspace"
     }
   });
 
@@ -986,8 +1417,21 @@ async function commandTask(argv) {
   }
 
   const writeCapable = options["read-only"] !== true;
+  const requestedDisclosureConsent = options["source-disclosure-consent"] === true;
+  const personalMode = options["personal-mode"] || null;
+  const authorizedProject = options["authorized-project"] || null;
+  const activeWorkspace = options["active-workspace"]
+    ? resolveWorkspaceRoot(options["active-workspace"])
+    : process.cwd();
+  const dataPolicyName = String(options["data-policy"] || (personalMode ? "personal-sanitized" : "strict")).trim().toLowerCase();
+  const requestedPersonalMode = String(personalMode || "").trim().toLowerCase();
+  const scopedConsent = dataPolicyName === "personal-sanitized" &&
+    (requestedPersonalMode === "once" || requestedPersonalMode === "on") &&
+    (authorizedProject != null || path.resolve(cwd) === path.resolve(activeWorkspace));
+  const sourceDisclosureConsent = requestedDisclosureConsent || scopedConsent;
+  const dataPolicy = normalizeDataPolicy(dataPolicyName, { consent: sourceDisclosureConsent });
   const workerPolicy = normalizeWorkerPolicy(
-    { ...options, prompt, readOnly: options["read-only"] === true, hostToolRequired: options["host-tool-required"] === true },
+    { ...options, prompt, dataPolicy, sourceDisclosureConsent, activeWorkspace, readOnly: options["read-only"] === true, hostToolRequired: options["host-tool-required"] === true },
     { toolName: "grok_rescue", writeCapable }
   );
 
@@ -1003,8 +1447,8 @@ async function commandTask(argv) {
   const writeMode = !options["read-only"] && control.permissionMode !== "plan";
   const completion = completionOptions(cwd, options, writeMode);
   const { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure } = completion;
-  const modelAlias = options.model;
-  const model = normalizeModel(options.model);
+  const modelAlias = options.model ?? "grok-4.6";
+  const model = normalizeModel(modelAlias);
   const effort = normalizeEffort(options.effort, modelAlias);
   const background = Boolean(options.background);
   const bestOfN = options["best-of-n"] ? Number(options["best-of-n"]) : null;
@@ -1012,6 +1456,23 @@ async function commandTask(argv) {
     options["worktree-name"] ||
     (options.worktree ? true : false);
   const check = Boolean(options.check);
+
+  assertGrokCliCompatibility({ bestOfN });
+
+  if (dataPolicy === "personal-sanitized" && background) {
+    throw new Error("personal-sanitized tasks currently require foreground execution so staged source can be applied and cleaned deterministically.");
+  }
+  if (dataPolicy === "personal-sanitized" && (options["resume-last"] || options["resume-session"] || options.worktree || options["worktree-name"])) {
+    throw new Error("personal-sanitized tasks must start fresh and cannot use Grok-managed worktrees; the companion already provides an isolated staging workspace.");
+  }
+  if (dataPolicy === "personal-sanitized" && writeMode) {
+    if (!rollbackOnFailure) {
+      throw new Error("personal-sanitized write tasks require rollbackOnFailure=true.");
+    }
+    if (!allowedChangedFiles.length) {
+      throw new Error("personal-sanitized write tasks require a non-empty allowedChangedFiles allowlist.");
+    }
+  }
 
   let resume = null;
   if (options.fresh) {
@@ -1032,13 +1493,25 @@ async function commandTask(argv) {
     bestOfN,
     worktree: worktree || null,
     worktreeRef: options["worktree-ref"] || null,
-    check
+    check,
+    dataPolicy,
+    personalMode: options["personal-mode"] || null,
+    authorizedProject: options["authorized-project"] || null,
+    activeWorkspace
+  });
+  const safePrompt = dataPolicy === "personal-sanitized" ? redactText(prompt).text : prompt;
+  const promptContract = promptCompletionContract(cwd, dataPolicy, {
+    expectedFiles,
+    allowedChangedFiles,
+    forbiddenChangedPaths,
+    checkCommand,
+    selfCheck: check
   });
 
   const job = createJobShell(cwd, {
     kind: "task",
-    title: titleFromPrompt(prompt),
-    prompt: appendCompletionContract(prompt, { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand }),
+    title: titleFromPrompt(safePrompt),
+    prompt: appendCompletionContract(safePrompt, promptContract),
     write: writeMode,
     model,
     effort,
@@ -1054,14 +1527,32 @@ async function commandTask(argv) {
       checkTimeoutMs,
       snapshot,
       rollbackOnFailure,
+      dataPolicy,
+      sourceDisclosureConsent,
+      personalMode: options["personal-mode"] || null,
+      authorizedProject: options["authorized-project"] || null,
+      activeWorkspace,
        config: { ...jobConfig, workerPolicy: summarizeWorkerPolicy(workerPolicy.workerPolicy) },
       workerPolicy: summarizeWorkerPolicy(workerPolicy.workerPolicy)
     }
   });
 
+  if (dataPolicy === "personal-sanitized") {
+    try {
+      job.disclosureStage = createDisclosureStage(cwd, { jobId: job.id, dataPolicy, consent: sourceDisclosureConsent });
+      job.workerPolicy = summarizeWorkerPolicy({ ...workerPolicy.workerPolicy, sourceStaged: true, dataDisclosure: dataPolicy, disclosureConsent: workerPolicy.workerPolicy.disclosureConsent });
+      job.config = { ...(job.config || {}), workerPolicy: job.workerPolicy };
+      writeJobFile(cwd, job);
+    } catch (error) {
+      cleanupPromptFile(job.promptFile);
+      cleanupDisclosureStage(job.disclosureStage);
+      throw error;
+    }
+  }
+
   let grokOptions = {
     promptFile: job.promptFile,
-    cwd,
+    cwd: job.disclosureStage?.stageRoot || cwd,
     write: writeMode || control.permissionMode === "plan",
     yolo: false,
     model,
@@ -1073,11 +1564,17 @@ async function commandTask(argv) {
     worktree,
     worktreeRef: options["worktree-ref"],
     verbatim: Boolean(options.verbatim),
+    dataPolicy,
+    sourceDisclosureConsent,
+    personalMode: options["personal-mode"] || null,
+    authorizedProject: options["authorized-project"] || null,
+    activeWorkspace,
+    sourceStaged: Boolean(job.disclosureStage),
     env: buildWorkerEnv(process.env)
   };
   grokOptions = applyControlToGrokOptions(grokOptions, control);
 
-  runOrBackground(cwd, job, grokOptions, {
+  await runOrBackground(cwd, job, grokOptions, {
     background,
     json: options.json,
     renderPayload: {
@@ -1086,6 +1583,7 @@ async function commandTask(argv) {
         kind: "task",
         status: finished.status,
         model,
+        effort,
         write: writeMode,
         grokSessionId: finished.grokSessionId,
         text: finished.resultText,
@@ -1097,7 +1595,7 @@ async function commandTask(argv) {
         bestOfN,
         worktree: Boolean(worktree),
          check,
-         workerPolicy: summarizeWorkerPolicy(workerPolicy.workerPolicy)
+         workerPolicy: finished.workerPolicy || summarizeWorkerPolicy(workerPolicy.workerPolicy)
       })
     }
   });
@@ -1116,8 +1614,8 @@ async function commandPlan(argv) {
   const control = controlFromParsedOptions({ ...options, plan: true });
   const completion = completionOptions(cwd, options, true);
   const { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure } = completion;
-  const model = normalizeModel(options.model);
-  const effort = normalizeEffort(options.effort, options.model);
+  const model = normalizeModel(options.model || "grok-4.6");
+  const effort = normalizeEffort(options.effort, options.model || "grok-4.6");
   const prompt = appendCompletionContract(buildPlanModePrompt(userPrompt), { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand });
   const jobConfig = controlToJobConfig(control, {});
 
@@ -1141,7 +1639,7 @@ async function commandPlan(argv) {
   };
   grokOptions = applyControlToGrokOptions(grokOptions, control);
 
-  runOrBackground(cwd, job, grokOptions, {
+  await runOrBackground(cwd, job, grokOptions, {
     background: Boolean(options.background),
     json: options.json,
     renderPayload: {
@@ -1205,8 +1703,8 @@ async function commandReview(argv, { adversarial = false } = {}) {
   const completion = completionOptions(cwd, options, false);
   const { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure } = completion;
   const prompt = buildStructuredReviewPrompt(target, focusText, { adversarial: isAdversarial });
-  const model = normalizeModel(options.model);
-  const effort = normalizeEffort(options.effort, options.model);
+  const model = normalizeModel(options.model || "grok-4.6");
+  const effort = normalizeEffort(options.effort, options.model || "grok-4.6");
   const kind = isAdversarial ? "adversarial-review" : "review";
   const jobConfig = controlToJobConfig(control, { postPending });
   const job = createJobShell(cwd, {
@@ -1261,7 +1759,7 @@ async function commandReview(argv, { adversarial = false } = {}) {
     reviewTarget: job.reviewTarget
   };
 
-  const runResult = runOrBackground(cwd, job, grokOptions, {
+  const runResult = await runOrBackground(cwd, job, grokOptions, {
     background: Boolean(options.background),
     json: options.json,
     renderPayload: {
@@ -1341,8 +1839,8 @@ async function commandWorkflow(argv) {
       args,
       validateOnly
     });
-    const model = normalizeModel(options.model);
-    const effort = normalizeEffort(options.effort, options.model);
+    const model = normalizeModel(options.model || "grok-4.6");
+    const effort = normalizeEffort(options.effort, options.model || "grok-4.6");
     const jobConfig = controlToJobConfig(control, { workflowName: name });
     // validate-only must not grant yolo write+shell — smoke-check only.
     const writeCapable = !validateOnly;
@@ -1368,7 +1866,7 @@ async function commandWorkflow(argv) {
     };
     grokOptions = applyControlToGrokOptions(grokOptions, control);
 
-    runOrBackground(cwd, job, grokOptions, {
+    await runOrBackground(cwd, job, grokOptions, {
       background: Boolean(options.background),
       json: options.json,
       renderPayload: {
@@ -1429,7 +1927,7 @@ async function commandDesign(argv) {
   };
   grokOptions = applyControlToGrokOptions(grokOptions, control);
 
-  runOrBackground(cwd, job, grokOptions, {
+  await runOrBackground(cwd, job, grokOptions, {
     background: Boolean(options.background),
     json: options.json,
     renderPayload: {
@@ -1497,8 +1995,8 @@ async function commandExecutePlan(argv) {
   }
 
   const control = controlFromParsedOptions(options);
-  const model = normalizeModel(options.model);
-  const effort = normalizeEffort(options.effort, options.model);
+  const model = normalizeModel(options.model || "grok-4.6");
+  const effort = normalizeEffort(options.effort, options.model || "grok-4.6");
   const dryRun = Boolean(options["dry-run"]);
   const prompt = buildExecutePlanPrompt(absDoc, {
     concurrency: options.concurrency ? Number(options.concurrency) : 4,
@@ -1538,7 +2036,7 @@ async function commandExecutePlan(argv) {
   };
   grokOptions = applyControlToGrokOptions(grokOptions, control);
 
-  runOrBackground(cwd, job, grokOptions, {
+  await runOrBackground(cwd, job, grokOptions, {
     background: Boolean(options.background),
     json: options.json,
     renderPayload: {
@@ -1570,8 +2068,8 @@ async function commandBabysit(argv) {
   const { action, prs } = parseBabysitInvocation(positionals);
   const cwd = resolveWorkspaceRoot(options.cwd || process.cwd());
   const control = controlFromParsedOptions(options);
-  const model = normalizeModel(options.model);
-  const effort = normalizeEffort(options.effort, options.model);
+  const model = normalizeModel(options.model || "grok-4.6");
+  const effort = normalizeEffort(options.effort, options.model || "grok-4.6");
   const prompt = buildBabysitPrompt(action, prs);
   const jobConfig = controlToJobConfig(control, { babysitAction: action });
   const background =
@@ -1602,7 +2100,7 @@ async function commandBabysit(argv) {
   };
   grokOptions = applyControlToGrokOptions(grokOptions, control);
 
-  runOrBackground(cwd, job, grokOptions, {
+  await runOrBackground(cwd, job, grokOptions, {
     background,
     json: options.json,
     renderPayload: {
@@ -1641,8 +2139,8 @@ async function commandDocument(argv) {
   const control = controlFromParsedOptions(options);
   const completion = completionOptions(cwd, options, true);
   const { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand, checkPolicy, checkTimeoutMs, snapshot, rollbackOnFailure } = completion;
-  const model = normalizeModel(options.model);
-  const effort = normalizeEffort(options.effort, options.model);
+  const model = normalizeModel(options.model || "grok-4.6");
+  const effort = normalizeEffort(options.effort, options.model || "grok-4.6");
   const prompt = appendCompletionContract(buildDocumentPrompt({ type: docType, brief, outputDir: outDir }), { expectedFiles, allowedChangedFiles, forbiddenChangedPaths, checkCommand });
   const jobConfig = controlToJobConfig(control, { documentType: docType });
 
@@ -1665,7 +2163,7 @@ async function commandDocument(argv) {
   };
   grokOptions = applyControlToGrokOptions(grokOptions, control);
 
-  runOrBackground(cwd, job, grokOptions, {
+  await runOrBackground(cwd, job, grokOptions, {
     background: Boolean(options.background),
     json: options.json,
     renderPayload: {
@@ -1807,8 +2305,8 @@ async function commandMedia(argv, kind) {
     : resolveMediaOutputDir(cwd, kind);
   fs.mkdirSync(outputDir, { recursive: true });
 
-  const model = normalizeModel(options.model);
-  const effort = normalizeEffort(options.effort, options.model);
+  const model = normalizeModel(options.model || "grok-4.6");
+  const effort = normalizeEffort(options.effort, options.model || "grok-4.6");
   const prompt =
     kind === "image"
       ? buildImagePrompt({
@@ -1851,7 +2349,7 @@ async function commandMedia(argv, kind) {
     rules: `Media-only mode. Prefer image_gen / image_edit / image_to_video / reference_to_video. Session media paths are fine; the companion copies them into ${outputDir}. Do not edit application source code. Do not run shell commands or try to move files. When finished, print absolute paths to every created file.`
   };
 
-  const finished = runOrBackground(cwd, job, grokOptions, {
+  const finished = await runOrBackground(cwd, job, grokOptions, {
     background: Boolean(options.background),
     json: options.json,
     renderPayload: {
@@ -1939,20 +2437,52 @@ async function commandStopGateReview(argv) {
 
   const schema = fs.readFileSync(getReviewSchemaPath(), "utf8");
   // Safer stop-gate posture: denylist editors/shell, no yolo, optional sandbox read-only.
+  const stopGatePolicy = normalizeWorkerPolicy(
+    { cwd, readOnly: true, sandbox: "read-only", noSubagents: true, disableWebSearch: true },
+    { toolName: "stop-gate", writeCapable: false }
+  );
+  job.workerPolicy = summarizeWorkerPolicy(stopGatePolicy.workerPolicy);
+  job.policyEvidence = createWorkerPolicyEvidence({
+    requested: job.policyEvidence?.requested || stopGatePolicy.policyEvidence.requested,
+    effective: job.workerPolicy
+  });
+  job.invocation = updateInvocationEnvelope(job.invocation, {
+    policyFingerprint: job.policyEvidence.fingerprint,
+    executionWorkspace: cwd
+  });
+  job.executionEnvironment = job.invocation.executionEnvironment;
+  job.environmentId = job.invocation.environmentId;
+  writeJobFile(cwd, job);
+  appendJobEvent(cwd, job.id, "policy_resolved", {
+    fingerprint: job.policyEvidence.fingerprint,
+    requested: job.policyEvidence.requested,
+    authority: job.policyEvidence.authority,
+    effective: job.policyEvidence.effective
+  });
   let grokResult;
   let finished;
+  const cancellation = watchJobCancellation(cwd, job);
   try {
-    grokResult = runGrok({
+    appendJobEvent(cwd, job.id, "process_started", { pid: null, background: false, backend: job.invocation.backend });
+    grokResult = await runGrokAsync({
       promptFile: job.promptFile,
       cwd,
       write: false,
       yolo: false,
       sandbox: "read-only",
       noSubagents: true,
-      jsonSchema: schema
+      jsonSchema: schema,
+      signal: cancellation.signal
     });
+    appendJobEvent(cwd, job.id, "process_exited", {
+      exitCode: grokResult.status,
+      signal: grokResult.signal || null,
+      cancelled: grokResult.cancelled === true
+    });
+    appendJobEvent(cwd, job.id, "output_closed", { processClosed: true, outputStats: grokResult.outputStats || null });
     finished = finalizeJob(cwd, job, grokResult, { parseReview: true });
   } finally {
+    cancellation.close();
     cleanupPromptFile(job.promptFile);
   }
   const blocked = Boolean(finished.review && reviewHasBlockingFindings(finished.review));
@@ -2013,7 +2543,7 @@ async function commandStatus(argv) {
   }
 
   const config = getConfig(cwd);
-  const runningJobs = jobs.filter((job) => job.status === "running");
+  const runningJobs = jobs.filter((job) => isActiveJobStatus(job.status));
   const payload = {
     jobs,
     runningCount: runningJobs.length,
@@ -2031,7 +2561,7 @@ async function commandResult(argv) {
   let job = resolveJob(cwd, jobId);
   job = maybeFinalizeBackgroundJob(cwd, readJobFile(cwd, job.id) || job);
   outputResult(options.json ? job : renderStoredJobResult(job), Boolean(options.json));
-  process.exitCode = job.status === "completed" ? 0 : job.status === "running" ? 0 : 1;
+  process.exitCode = job.status === "completed" ? 0 : isActiveJobStatus(job.status) ? 0 : 1;
 }
 
 async function commandCancel(argv) {
@@ -2041,34 +2571,82 @@ async function commandCancel(argv) {
   let job = resolveJob(cwd, jobId);
   job = readJobFile(cwd, job.id) || job;
 
-  if (job.status !== "running") {
+  if (!isActiveJobStatus(job.status)) {
     const payload = { jobId: job.id, cancelled: false, reason: `Job is already ${job.status}` };
     outputResult(options.json ? payload : `Job \`${job.id}\` is already ${job.status}.\n`, Boolean(options.json));
     return;
   }
 
-  const pid = job.pid ?? readPidFile(resolveJobPidFile(cwd, job.id));
-  const killed = pid ? terminateProcessTree(pid, "SIGTERM") : false;
-  const finishedAt = nowIso();
-  const fullJob = {
-    ...job,
-    status: "cancelled",
-    finishedAt,
-    updatedAt: finishedAt,
-    summary: "Cancelled by user",
-    error: "Cancelled"
-  };
+  const marker = requestJobCancellation(cwd, job.id, "Cancelled by user");
+  if (job.cancelFile && path.resolve(job.cancelFile) !== path.resolve(resolveJobCancelFile(cwd, job.id))) {
+    writeJsonAtomic(job.cancelFile, marker);
+  }
   upsertJob(cwd, {
     id: job.id,
-    status: "cancelled",
-    finishedAt,
-    summary: fullJob.summary,
-    error: fullJob.error
+    status: "cancel_requested",
+    cancelRequestedAt: marker.requestedAt,
+    summary: "Cancellation requested"
   });
-  writeJobFile(cwd, fullJob);
+  job = { ...job, status: "cancel_requested", cancelRequestedAt: marker.requestedAt };
+  writeJobFile(cwd, job);
+  writeJobProgress(cwd, job.id, {
+    phase: "cancel_requested",
+    message: "Cancellation requested",
+    cancelRequestedAt: marker.requestedAt
+  });
+  appendJobEvent(cwd, job.id, "cancel_requested", {
+    requestedAt: marker.requestedAt,
+    reason: marker.reason,
+    source: "grok_cancel"
+  }, { at: marker.requestedAt });
 
-  const payload = { jobId: job.id, cancelled: true, killed, pid };
+  const pid = job.pid ?? readPidFile(resolveJobPidFile(cwd, job.id));
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const stored = readJobFile(cwd, job.id) || job;
+    job = maybeFinalizeBackgroundJob(cwd, stored);
+    if (!isActiveJobStatus(job.status)) break;
+  }
+
+  let killed = false;
+  if (isActiveJobStatus(job.status) && pid) {
+    killed = terminateProcessTree(pid, "SIGKILL");
+    const exited = await waitForProcessExit(pid, { timeoutMs: 10_000 });
+    if (exited && !tryReadResultPayload(job.resultFile).ok) {
+      const timestamp = nowIso();
+      writeJsonAtomic(job.resultFile, {
+        exitCode: 1,
+        signal: "SIGKILL",
+        stdout: "",
+        stderr: "",
+        finishedAt: timestamp,
+        sessionId: null,
+        cancelled: true,
+        cancellationReason: "Cancelled by user after forced process-tree termination",
+        lifecycle: {
+          cancelRequestedAt: marker.requestedAt,
+          exitedAt: timestamp,
+          closedAt: timestamp
+        }
+      });
+      job = maybeFinalizeBackgroundJob(cwd, readJobFile(cwd, job.id) || job);
+    }
+  }
+
+  const cancelled = job.status === "cancelled" || job.status === "cancelled_rolled_back";
+  const payload = {
+    jobId: job.id,
+    cancelled,
+    cancelRequested: true,
+    processClosed: !pid || !isActiveJobStatus(job.status),
+    killed,
+    pid,
+    status: job.status,
+    rollback: job.rollback || null
+  };
   outputResult(options.json ? payload : renderCancelReport(job, killed), Boolean(options.json));
+  process.exitCode = cancelled ? 0 : 1;
 }
 
 async function main() {

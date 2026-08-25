@@ -3,7 +3,14 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
-import { binaryAvailable, runCommand } from "./process.mjs";
+import {
+  binaryAvailable,
+  HeadTailBuffer,
+  quoteWindowsArg,
+  resolveSpawnCommand,
+  runCommand,
+  runCommandAsync
+} from "./process.mjs";
 import {
   buildWorkerEnv,
   cleanupCommandGuard,
@@ -28,6 +35,16 @@ export const MEDIA_DISALLOWED_TOOLS =
 export const READ_ONLY_TOOLS = "read_file,grep,list_dir";
 export const MEDIA_TOOLS = "image_gen,image_edit,image_to_video,reference_to_video,list_dir,read_file";
 export const WORKER_DISALLOWED_COMMANDS = HOST_ONLY_COMMANDS.map((command) => `Bash(${command} *)`).join(",");
+
+export function assertGrokCliCompatibility(options = {}) {
+  const bestOfN = Number(options.bestOfN || 0);
+  if (Number.isFinite(bestOfN) && bestOfN > 1) {
+    throw new Error(
+      "The installed Grok CLI does not support the plugin-level bestOfN option. " +
+      "Run separate Grok tasks instead of requesting --best-of-n."
+    );
+  }
+}
 
 export function resolveGrokBinary() {
   const envPath = process.env.GROK_BINARY;
@@ -164,12 +181,6 @@ export function buildGrokArgs(options = {}) {
   if (options.maxTurns) {
     args.push("--max-turns", String(options.maxTurns));
   }
-  if (options.bestOfN && Number(options.bestOfN) > 1) {
-    args.push("--best-of-n", String(options.bestOfN));
-  }
-  if (options.check) {
-    args.push("--check");
-  }
   if (options.worktree) {
     if (typeof options.worktree === "string" && options.worktree !== "true") {
       args.push("--worktree", options.worktree);
@@ -303,8 +314,15 @@ export function humanizeGrokFailure(sources = {}) {
     return "Grok rate-limited the request. Wait a moment and retry.";
   }
 
+  if (/unexpected argument ['\"]--(?:check|best-of-n)['\"]/i.test(blob)) {
+    return (
+      "The installed Grok CLI does not support a plugin orchestration flag (`--check` or `--best-of-n`). " +
+      "Update the Grok worker plugin and retry; self-check is handled in the task contract."
+    );
+  }
+
   if (/model .+ not found|unknown model|invalid model/i.test(blob)) {
-    return "Grok rejected the model id. Use a valid model (e.g. `grok-4.5` or `--model fast`).";
+    return "Grok rejected the model id. Use a valid model (e.g. `grok-4.6` or `--model fast`).";
   }
 
   // Prefer structured JSON error message if present in the blob
@@ -415,6 +433,7 @@ export function runGrok(options = {}) {
     toolName: options.workerPolicy?.toolName || "grok-foreground",
     writeCapable: options.write === true
   });
+  assertGrokCliCompatibility(effectiveOptions);
   const args = buildGrokArgs(effectiveOptions);
   const commandGuard = createCommandGuard();
   const env = prependCommandGuard(
@@ -455,6 +474,70 @@ export function runGrok(options = {}) {
     stderr,
     parsed,
     ok,
+    workerPolicy: summarizeWorkerPolicy(effectiveOptions.workerPolicy)
+  };
+}
+
+export async function runGrokAsync(options = {}) {
+  const availability = getGrokAvailability();
+  if (!availability.available) {
+    throw new Error(availability.reason);
+  }
+
+  const effectiveOptions = normalizeWorkerPolicy(options, {
+    toolName: options.workerPolicy?.toolName || "grok-foreground",
+    writeCapable: options.write === true
+  });
+  assertGrokCliCompatibility(effectiveOptions);
+  const args = buildGrokArgs(effectiveOptions);
+  const commandGuard = createCommandGuard();
+  const env = prependCommandGuard(
+    buildWorkerEnv({ ...process.env, ...(effectiveOptions.env ?? {}) }, { grokBinary: availability.binary }),
+    commandGuard
+  );
+  let result;
+  try {
+    result = await runCommandAsync(availability.binary, args, {
+      cwd: effectiveOptions.cwd,
+      maxBuffer: effectiveOptions.maxBuffer,
+      env: { ...env, RUST_LOG: effectiveOptions.rustLog ?? "off" },
+      signal: effectiveOptions.signal,
+      timeout: effectiveOptions.timeout,
+      killGraceMs: effectiveOptions.killGraceMs
+    });
+  } finally {
+    cleanupCommandGuard(commandGuard);
+  }
+
+  const stdout = String(result.stdout ?? "");
+  const stderr = String(result.stderr ?? "");
+  const parsed = parseGrokJsonOutput(stdout);
+  const ok = result.status === 0 && parsed.ok && !result.cancelled && !result.timedOut;
+  if (!ok) {
+    parsed.error = result.cancelled
+      ? result.cancellationReason || "Cancelled"
+      : humanizeGrokFailure({
+        parsedError: parsed.error,
+        stderr,
+        stdout,
+        exitCode: result.status
+      });
+  }
+
+  return {
+    binary: availability.binary,
+    args,
+    status: result.status,
+    signal: result.signal,
+    stdout,
+    stderr,
+    parsed,
+    ok,
+    cancelled: result.cancelled,
+    cancellationReason: result.cancellationReason,
+    timedOut: result.timedOut,
+    pid: result.pid,
+    outputStats: result.outputStats,
     workerPolicy: summarizeWorkerPolicy(effectiveOptions.workerPolicy)
   };
 }
@@ -627,13 +710,18 @@ export function buildGrokBackgroundWrapperSource({
   cwd = process.cwd(),
   streaming = false,
   env = null,
-  commandGuardDir = ""
+  commandGuardDir = "",
+  cancelFile = "",
+  companionPath = "",
+  jobId = "",
+  maxCaptureBytes = 8 * 1024 * 1024,
+  maxLogBytes = 4 * 1024 * 1024
 }) {
   // Embed the same function the module exports (not a hand-maintained copy).
   const streamProgressHelper = getStreamProgressHelperSource();
   const streamLogSanitizer = getStreamLogSanitizerSource();
   return `
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const nodePath = require("node:path");
 const binary = ${JSON.stringify(binary)};
@@ -646,6 +734,21 @@ const cwd = ${JSON.stringify(cwd)};
 const streaming = ${JSON.stringify(streaming)};
 const childEnv = ${JSON.stringify(env || {})};
 const commandGuardDir = ${JSON.stringify(commandGuardDir || "")};
+const cancelFile = ${JSON.stringify(cancelFile || "")};
+const companionPath = ${JSON.stringify(companionPath || "")};
+const jobId = ${JSON.stringify(jobId || "")};
+const maxCaptureBytes = ${JSON.stringify(maxCaptureBytes)};
+const maxLogBytes = ${JSON.stringify(maxLogBytes)};
+
+${HeadTailBuffer.toString()}
+${quoteWindowsArg.toString()}
+${resolveSpawnCommand.toString()}
+
+function writeAtomic(filePath, contents) {
+  const tmp = filePath + ".tmp." + process.pid + "." + Math.random().toString(36).slice(2);
+  fs.writeFileSync(tmp, contents);
+  fs.renameSync(tmp, filePath);
+}
 
 function cleanupPromptFile() {
   if (!promptFile) return;
@@ -668,6 +771,16 @@ function append(line) {
   if (!logFile) return;
   try {
     fs.appendFileSync(logFile, "[" + new Date().toISOString() + "] " + line + "\\n");
+    const stat = fs.statSync(logFile);
+    if (stat.size > maxLogBytes) {
+      const retainedBytes = Math.floor(maxLogBytes / 2);
+      const fd = fs.openSync(logFile, "r");
+      const tail = Buffer.alloc(retainedBytes);
+      try { fs.readSync(fd, tail, 0, retainedBytes, stat.size - retainedBytes); }
+      finally { fs.closeSync(fd); }
+      const marker = Buffer.from("[... earlier bounded log output omitted ...]\\n", "utf8");
+      writeAtomic(logFile, Buffer.concat([marker, tail]));
+    }
   } catch {}
 }
 
@@ -683,30 +796,35 @@ function writeProgress(patch) {
       ...patch,
       updatedAt: new Date().toISOString()
     };
-    fs.writeFileSync(progressFile, JSON.stringify(next, null, 2) + "\\n");
+    writeAtomic(progressFile, JSON.stringify(next, null, 2) + "\\n");
   } catch {}
 }
 
 append("Starting Grok: " + binary + " " + args.join(" "));
 writeProgress({ phase: "starting", message: "Launching Grok", lines: 0 });
 
-const child = spawn(binary, args, {
+const resolved = resolveSpawnCommand(binary, args);
+const child = spawn(resolved.command, resolved.args, {
   cwd,
   env: { ...childEnv, RUST_LOG: "off" },
-  stdio: ["ignore", "pipe", "pipe"]
+  detached: process.platform !== "win32",
+  stdio: ["ignore", "pipe", "pipe"],
+  windowsHide: true
 });
 child.on("error", () => {
   cleanupPromptFile();
   cleanupCommandGuard();
 });
 
-let stdout = "";
-let stderr = "";
-let textAcc = "";
-let thoughtAcc = "";
+const stdoutCapture = new HeadTailBuffer(maxCaptureBytes);
+const stderrCapture = new HeadTailBuffer(maxCaptureBytes);
+const textCapture = new HeadTailBuffer(maxCaptureBytes);
+const thoughtCapture = new HeadTailBuffer(Math.min(maxCaptureBytes, 1024 * 1024));
 let sessionId = null;
 let lineCount = 0;
 let lastMessage = "running";
+let cancelRequested = false;
+let cancelRequestedAt = null;
 
 ${streamProgressHelper}
 ${streamLogSanitizer}
@@ -720,13 +838,13 @@ function handleStreamLine(line) {
   try {
     const evt = JSON.parse(trimmed);
     if (evt.type === "text" && evt.data) {
-      textAcc += evt.data;
+      textCapture.append(evt.data);
       // Tail of accumulated text; floor empty so whitespace-only tokens keep "running"
-      lastMessage = formatStreamProgressMessage(textAcc, {}) || "running";
+      lastMessage = formatStreamProgressMessage(textCapture.toString({ marker: false }), {}) || "running";
     } else if (evt.type === "thought" && evt.data) {
-      thoughtAcc += evt.data;
+      thoughtCapture.append(evt.data);
       lastMessage =
-        formatStreamProgressMessage(thoughtAcc, { prefix: "thinking: " }) || "running";
+        formatStreamProgressMessage(thoughtCapture.toString({ marker: false }), { prefix: "thinking: " }) || "running";
     } else if (evt.type === "end") {
       sessionId = evt.sessionId || sessionId;
       lastMessage = "finishing";
@@ -750,7 +868,7 @@ function handleStreamLine(line) {
 let stdoutBuf = "";
 child.stdout.on("data", (chunk) => {
   const text = chunk.toString();
-  stdout += text;
+  stdoutCapture.append(chunk);
   stdoutBuf += text;
   let idx;
   while ((idx = stdoutBuf.indexOf("\\n")) !== -1) {
@@ -762,24 +880,39 @@ child.stdout.on("data", (chunk) => {
   }
 });
 child.stderr.on("data", (chunk) => {
-  const text = chunk.toString();
-  stderr += text;
+  stderrCapture.append(chunk);
   append("[stderr] diagnostics emitted");
   writeProgress({ phase: "running", message: "stderr diagnostics emitted", lines: lineCount });
 });
+const cancelPoll = cancelFile ? setInterval(() => {
+  if (cancelRequested || !fs.existsSync(cancelFile)) return;
+  cancelRequested = true;
+  cancelRequestedAt = new Date().toISOString();
+  writeProgress({ phase: "cancel_requested", message: "Cancellation requested", cancelRequestedAt });
+  if (process.platform === "win32") {
+    spawnSync("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
+  } else {
+    try { process.kill(-child.pid, "SIGTERM"); }
+    catch { try { child.kill("SIGTERM"); } catch {} }
+  }
+}, 100) : null;
+cancelPoll?.unref?.();
 child.on("close", (code, signal) => {
+  if (cancelPoll) clearInterval(cancelPoll);
   if (stdoutBuf.trim()) {
     const sanitized = sanitizeStreamLogLine(stdoutBuf, toolLogContext);
     if (sanitized) append(sanitized);
     if (streaming) handleStreamLine(stdoutBuf);
   }
 
+  const stdout = stdoutCapture.toString();
+  const stderr = stderrCapture.toString();
   let finalStdout = stdout;
   if (streaming) {
     // Reconstruct a json-format-like payload for the companion parser.
     finalStdout = JSON.stringify({
-      text: textAcc || stdout,
-      stopReason: code === 0 ? "EndTurn" : "Error",
+      text: textCapture.toString() || stdout,
+      stopReason: cancelRequested ? "Cancelled" : (code === 0 ? "EndTurn" : "Error"),
       sessionId,
       requestId: null
     });
@@ -791,17 +924,28 @@ child.on("close", (code, signal) => {
     stdout: finalStdout,
     stderr,
     finishedAt: new Date().toISOString(),
-    sessionId
+    sessionId,
+    cancelled: cancelRequested,
+    cancellationReason: cancelRequested ? "Cancelled by user" : null,
+    lifecycle: {
+      cancelRequestedAt,
+      exitedAt: new Date().toISOString(),
+      closedAt: new Date().toISOString()
+    },
+    outputStats: {
+      stdout: stdoutCapture.stats(),
+      stderr: stderrCapture.stats(),
+      text: textCapture.stats(),
+      thought: thoughtCapture.stats()
+    }
   };
   try {
     // Atomic write: only publish result.json when the full payload is on disk.
     // Avoids reaper/finalize seeing a truncated mid-write file as "exists".
-    const tmp = resultFile + ".tmp." + process.pid;
-    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + "\\n");
-    fs.renameSync(tmp, resultFile);
+    writeAtomic(resultFile, JSON.stringify(payload, null, 2) + "\\n");
     writeProgress({
-      phase: code === 0 ? "completed" : "failed",
-      message: code === 0 ? "completed" : "failed with code " + code,
+      phase: "closed",
+      message: cancelRequested ? "cancelled and closed" : (code === 0 ? "completed and closed" : "failed with code " + code),
       lines: lineCount,
       sessionId
     });
@@ -811,7 +955,15 @@ child.on("close", (code, signal) => {
   }
   cleanupPromptFile();
   cleanupCommandGuard();
-  process.exit(code === null ? 1 : code);
+  if (companionPath && jobId) {
+    spawnSync(process.execPath, [companionPath, "result", jobId, "--json"], {
+      cwd,
+      env: childEnv,
+      stdio: "ignore",
+      windowsHide: true
+    });
+  }
+  process.exit(cancelRequested ? 1 : (code === null ? 1 : code));
 });
 `.trim();
 }
@@ -830,6 +982,7 @@ export function spawnGrokBackground(options = {}) {
     toolName: options.workerPolicy?.toolName || "grok-background",
     writeCapable: options.write === true
   });
+  assertGrokCliCompatibility(effectiveOptions);
   const useStreaming = Boolean(effectiveOptions.progressFile);
   const args = buildGrokArgs({
     ...effectiveOptions,
@@ -857,7 +1010,12 @@ export function spawnGrokBackground(options = {}) {
         buildWorkerEnv({ ...process.env, ...(effectiveOptions.env ?? {}) }, { grokBinary: availability.binary }),
         commandGuard
       ),
-      commandGuardDir: commandGuard
+      commandGuardDir: commandGuard,
+      cancelFile: effectiveOptions.cancelFile || "",
+      companionPath: effectiveOptions.companionPath || "",
+      jobId: effectiveOptions.jobId || "",
+      maxCaptureBytes: effectiveOptions.maxBuffer ?? 8 * 1024 * 1024,
+      maxLogBytes: effectiveOptions.maxLogBytes ?? 4 * 1024 * 1024
     });
   } catch (error) {
     cleanupCommandGuard(commandGuard);

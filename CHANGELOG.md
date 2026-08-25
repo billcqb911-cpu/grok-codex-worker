@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Canonical MCP tool manifest**: schemas, annotations, companion serializers, dynamic read/write classification, parallel/background capability, and approval class now come from one startup-validated manifest.
+- **Invocation and environment identity**: jobs/results now persist an invocation id, MCP request id, job id, tool/backend/model/attempt, policy fingerprint, active/target/execution workspaces, root set, and stable environment id.
+- **Policy composition evidence**: added redacted `requested`, plugin `authority`, and `effective` policy layers plus a stable SHA-256 fingerprint while retaining `workerPolicy` compatibility.
+- **Append-only lifecycle journal**: each job records bounded/redacted NDJSON events with locked contiguous sequence numbers across acceptance, policy, process, cancellation, verification, rollback, and terminal publication.
+- **Reusable MCP stdio harness**: source and installed-cache tests now share lifecycle, request-id, timeout, NDJSON, cancellation, stderr, and cleanup behavior.
+
+### Reliability
+- **Workspace write lease**: write-capable jobs are serialized per canonical workspace while read/status/result/cancel operations remain concurrent.
+- **Confirmed cancellation**: MCP cancellation reaches the active worker, waits for process-tree close, forces rollback for cancelled writes, and prevents duplicate terminal publication.
+- **Bounded atomic projections**: foreground/background captures and persistent logs expose retained/omitted byte evidence; job, progress, cancellation, state, and result writes are atomic. Detached jobs finalize and release their lease without requiring a later poll.
+
+### Security
+- **Dedicated Personal read boundary**: added `grok_personal_read` with static read-only/non-destructive MCP annotations and a minimal schema. It still declares open-world access because the sanitized staging copy is sent to the configured remote Grok upstream. Personal writes remain on destructive `grok_rescue`.
+- **Task-local Personal project scope**: external project disclosure now requires `personalMode=once` plus an exact `authorizedProject` matching `cwd`. `on` is limited to the active workspace, while `off` and `status` do not read projects or call Grok.
+
+### Changed
+- **Approval routing**: Personal read-only analysis no longer enters the write-capable `grok_rescue` automatic approval path, which could time out before a Grok job was created. The dedicated tool forces sanitized disclosure, read-only mode, fresh/no-memory execution, no subagents/web search, and `grok-4.6 + high` defaults.
+- **Personal shorthand and default effort**: `once`/`on` in the active workspace now imply one-task credential-redacted disclosure consent; external projects still require an exact `authorizedProject`. Rescue and read-oriented task defaults now use `grok-4.6` with `high` effort, while `fast` remains an explicit low-effort preset.
+
+### Fixed
+- **Explicit Codex workspace identity**: Personal MCP calls now require `activeWorkspace` from Codex `environment_context.cwd` and preserve it through companion CLI parsing, scope validation, job config, and policy evidence. The installed MCP server no longer mistakes its plugin-cache process directory for the current project.
+- **Installed-cache regression**: added a real cached-plugin stdio test with full source/cache SHA-256 parity and mock Grok coverage for current-project success, external-project rejection without authorization, and exact one-request external authorization.
+
 ## 0.5.8
 
 ### Fixed
@@ -80,6 +106,20 @@
 - Initial Codex MCP plugin: setup, rescue, review, adversarial review, image, video, status, result, cancel, transfer.
 ## Unreleased
 
+- Fixed Grok 1.0.5 compatibility: plugin-level `check` and `bestOfN` controls
+  are no longer sent as unsupported `--check`/`--best-of-n` CLI arguments.
+  `check` is now expressed in the completion prompt, while `bestOfN > 1`
+  fails before job creation with an explicit compatibility error.
+- Personal Grok Auto now relays failed delegation evidence without silently
+  substituting a local analysis.
+
+- Fixed MCP job serialization so policy-enforced `memory: { enable: false }` cannot become `--memory`; disabled memory now emits at most one `--no-memory` flag.
+- Kept MCP policy validation separate from caller CLI serialization, preventing original-workspace allow rules from breaking Personal staging after its workspace path changes.
+- Removed always-rejected agent, memory-enablement, and caller-allow inputs from public MCP schemas; Personal disclosure controls are now exposed only by `grok_rescue`.
+- Personal staging now skips conventional dependency/build/cache directories and files larger than 10 MiB before reading them.
+- Renamed the original skill UI entry to `Grok Auto (Standard)` and added the explicit-only `Grok Auto (Personal)` entry.
+- Added the `personal-sanitized` data policy with explicit source-disclosure consent, credential-aware temporary staging, prompt/result redaction, and worker-policy evidence.
+- Personal read/write tasks keep the Phase 7 execution boundary. Writes run fresh in the foreground, require rollback plus an exact changed-file allowlist, preflight every staged change atomically, and never write back files that contained redactions.
 - Added the explicit-only `grok-auto` skill as a task-local unified entry point, with `on`, `once`, `status`, and `off` modes and no `AGENTS.md` persistence.
 - Added a detailed Chinese user guide covering Grok Auto, direct MCP calls, safety contracts, background jobs, permission boundaries, installation, updates, and troubleshooting.
 - Added Phase 7A permission and capability isolation.

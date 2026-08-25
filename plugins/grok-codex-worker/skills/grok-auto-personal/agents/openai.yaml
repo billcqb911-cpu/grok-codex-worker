@@ -1,0 +1,6 @@
+interface:
+  display_name: "Grok Auto (Personal)"
+  short_description: "Route personal project work through credential-redacted source staging"
+  default_prompt: "Use $grok-auto-personal for credential-redacted personal routing; external projects require once plus an exact authorized project path."
+policy:
+  allow_implicit_invocation: false

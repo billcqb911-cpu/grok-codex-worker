@@ -3,7 +3,7 @@ name: grok-auto
 description: Explicitly enable, disable, or use once a task-local mode where Codex decides whether and how to delegate project work to Grok.
 ---
 
-# Grok Auto
+# Grok Auto (Standard)
 
 Provide one user-facing entry point while keeping Codex as the task leader. This
 mode is conversational state for the current Codex task only. Do not persist it
@@ -20,8 +20,8 @@ Interpret text supplied with the skill as follows:
 - `off`: set this task to `OFF`. Do not call a Grok tool in the same turn.
 - `status`: report `AUTO`, `ONCE`, or `OFF` without calling Grok.
 
-After a mode change, state it briefly as `Grok Auto: AUTO`, `Grok Auto: ONCE`,
-or `Grok Auto: OFF`. A new Codex task always starts `OFF` unless the user invokes
+After a mode change, state it briefly as `Grok Auto (Standard): AUTO`, `Grok Auto (Standard): ONCE`,
+or `Grok Auto (Standard): OFF`. A new Codex task always starts `OFF` unless the user invokes
 this skill there. Explicit user instructions such as "do not use Grok for this
 request" override `AUTO` for that request without disabling later automatic
 routing.
@@ -56,9 +56,9 @@ Pass the active project's absolute `cwd` on every Grok MCP call. If the task's
 workspace is ambiguous, resolve it from the active Codex project before calling
 Grok; ask only when it cannot be determined safely.
 
-For read-only investigation, set `readOnly=true`, use Grok 4.6 unless the user
-requests another model, start fresh unless continuity is useful, and keep web
-search and subagents disabled.
+For read-only investigation, set `readOnly=true`, use `grok-4.6` with `high`
+effort unless the user requests another model or a faster run, start fresh
+unless continuity is useful, and keep web search and subagents disabled.
 
 For write-capable work:
 
@@ -89,3 +89,9 @@ context to Grok, verifies the result, and performs any final host action.
 
 User authorization to call Grok does not authorize unrelated external actions
 or broader filesystem access.
+
+Standard mode does not retain authorization for projects outside the active
+Codex workspace. Its `once` command keeps the existing one-request routing
+semantics; it does not accept or persist Personal `authorizedProject` scope.
+For explicitly consented credential-redacted disclosure of an external project,
+use Grok Auto (Personal) with `once` and the exact project path.

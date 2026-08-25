@@ -1,6 +1,6 @@
 interface:
-  display_name: "Grok Codex Worker: Grok Auto"
-  short_description: "Let Codex automatically route suitable work to Grok"
+  display_name: "Grok Auto (Standard)"
+  short_description: "Automatically route suitable work to Grok with standard disclosure rules"
   default_prompt: "Use $grok-auto to enable task-local automatic Grok routing."
 policy:
   allow_implicit_invocation: false
